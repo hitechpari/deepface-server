@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker app.main:app --timeout 120
+    startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker app.main:app --timeout 300
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
