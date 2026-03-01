@@ -10,5 +10,4 @@ Pillow==10.1.0
 gunicorn==21.2.0
 python-dotenv==1.0.0
 mtcnn==0.1.1
-keras==2.18.0       # 👈 Updated to match TensorFlow
 scipy==1.11.4
