@@ -9,39 +9,26 @@ from datetime import datetime
 import gc
 import time
 
-# Set environment variables for maximum memory optimization
+# Set environment variables
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
 os.environ['TF_NUM_INTEROP_THREADS'] = '1'
-os.environ['MALLOC_TRIM_THRESHOLD_'] = '100000'
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DeepFace import with memory optimization
+# DeepFace import
 DEEPFACE_AVAILABLE = False
 try:
     import tensorflow as tf
-    # Aggressive memory limiting
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-            tf.config.experimental.set_virtual_device_configuration(
-                gpu,
-                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=256)]
-            )
-    else:
-        # For CPU, limit thread usage aggressively
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-        tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
     
     from deepface import DeepFace
-    from deepface.commons import functions
     DEEPFACE_AVAILABLE = True
     logger.info("✅ DeepFace imported successfully")
 except Exception as e:
@@ -64,40 +51,9 @@ KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============================================
-# MEMORY OPTIMIZATION FUNCTIONS
-# ============================================
-
 def cleanup_memory():
-    """Aggressive memory cleanup"""
     gc.collect()
-    # Small delay to allow memory to be freed
-    time.sleep(0.5)
-
-def load_model_safely(model_name):
-    """Load model with memory checks"""
-    try:
-        logger.info(f"Loading model: {model_name}")
-        # Just reference the model - DeepFace will load it
-        return True
-    except Exception as e:
-        logger.error(f"Failed to load {model_name}: {e}")
-        return False
-
-def unload_model(model_name):
-    """Try to unload model from memory"""
-    try:
-        # Clear any references
-        if model_name in globals():
-            del globals()[model_name]
-        cleanup_memory()
-        logger.info(f"Unloaded model: {model_name}")
-    except:
-        pass
-
-# ============================================
-# API ENDPOINTS
-# ============================================
+    time.sleep(0.2)
 
 @app.get("/")
 async def root():
@@ -119,7 +75,6 @@ async def health_check():
 
 @app.post("/add-face-base64")
 async def add_face_base64(data: dict):
-    """Add face from base64 image"""
     try:
         image_base64 = data.get('image')
         name = data.get('name')
@@ -128,15 +83,10 @@ async def add_face_base64(data: dict):
         city = data.get('city')
         state = data.get('state')
         
-        logger.info(f"📸 Add face request: {name}")
-        
         if not image_base64:
             raise HTTPException(status_code=400, detail="No image provided")
         
-        # Decode base64
         image_data = base64.b64decode(image_base64)
-        
-        # Create metadata string
         metadata = f"{name}|{age}|{mobile}|{city}|{state}"
         filename = f"{metadata}_{uuid.uuid4()}.jpg"
         file_path = KNOWN_FACES_DIR / filename
@@ -145,15 +95,7 @@ async def add_face_base64(data: dict):
             buffer.write(image_data)
         
         logger.info(f"✅ File saved: {filename}")
-        
-        # Clean up
-        cleanup_memory()
-        
-        return {
-            "success": True,
-            "message": "Face added successfully",
-            "filename": filename
-        }
+        return {"success": True, "message": "Face added successfully"}
     
     except Exception as e:
         logger.error(f"❌ Error: {e}")
@@ -161,11 +103,9 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - 6 MODELS WITH MEMORY OPTIMIZATION"""
+    """Search for a face - SHOW ALL MATCHES FROM 20% TO 100%"""
     try:
         image_base64 = data.get('image')
-        
-        logger.info("🔍 Search request received")
         
         if not image_base64:
             raise HTTPException(status_code=400, detail="No image provided")
@@ -187,35 +127,27 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return []
         
-        # ===== 6 MODELS WITH SEQUENTIAL LOADING =====
+        # ===== 6 MODELS - 20% THRESHOLD =====
         all_matches = []
         
-        # Define all 6 models with their configurations
         models_config = [
-            # (model_name, metric, priority)
-            ("Facenet512", "cosine", 1),        # Best overall
-            ("Facenet512", "euclidean_l2", 2),   # Different metric
-            ("ArcFace", "cosine", 3),            # Age-invariant
-            ("VGGFace", "cosine", 4),            # Traditional
-            ("Dlib", "cosine", 5),               # Lightweight
-            ("OpenFace", "cosine", 6),            # Alternative
+            # (model_name, metric, min_similarity)
+            ("Facenet512", "cosine", 20),        # 20% similarity minimum
+            ("Facenet512", "euclidean_l2", 20),   # 20% similarity minimum
+            ("ArcFace", "cosine", 20),            # 20% similarity minimum
+            ("VGGFace", "cosine", 20),            # 20% similarity minimum
+            ("Dlib", "cosine", 20),               # 20% similarity minimum
+            ("OpenFace", "cosine", 20),           # 20% similarity minimum
         ]
         
-        # Single detector to save memory
         detector = "opencv"
         
-        # Process models one by one with memory cleanup between each
-        for model_name, metric, priority in models_config:
+        for model_name, metric, min_sim in models_config:
             try:
-                logger.info(f"🔄 [{priority}/6] Trying {model_name} with {metric}")
+                logger.info(f"🔄 Trying {model_name} with {metric}")
                 
-                # Clean memory before loading new model
                 cleanup_memory()
                 
-                # Small delay to ensure memory is freed
-                time.sleep(0.3)
-                
-                # Run face recognition
                 dfs = DeepFace.find(
                     img_path=str(temp_path),
                     db_path=str(KNOWN_FACES_DIR),
@@ -237,8 +169,8 @@ async def search_face_base64(data: dict):
                         else:
                             similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
                         
-                        # Only include matches above 30%
-                        if similarity >= 30:
+                        # Include ALL matches (even 20% similarity)
+                        if similarity >= min_sim:
                             # Extract metadata
                             db_path = Path(row['identity'])
                             filename_parts = db_path.name.split('_')
@@ -257,13 +189,11 @@ async def search_face_base64(data: dict):
                             all_matches.append(person_info)
                             logger.info(f"✅ Match: {similarity:.1f}% via {model_name}")
                 
-                # Clean up after each model
                 del dfs
                 cleanup_memory()
                 
             except Exception as e:
                 logger.warning(f"{model_name} failed: {e}")
-                # Still clean up even if failed
                 cleanup_memory()
                 continue
         
@@ -273,7 +203,7 @@ async def search_face_base64(data: dict):
             logger.info("❌ No matches found")
             return []
         
-        # Remove duplicates - keep highest score for each person
+        # Remove duplicates
         unique_matches = {}
         for match in all_matches:
             name = match['name']
@@ -283,11 +213,7 @@ async def search_face_base64(data: dict):
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        logger.info(f"✅ Returning {len(final_results)} matches from 6 models")
-        
-        # Final cleanup
-        cleanup_memory()
-        
+        logger.info(f"✅ Returning {len(final_results)} matches (20% to 100%)")
         return final_results
     
     except Exception as e:
@@ -296,7 +222,6 @@ async def search_face_base64(data: dict):
 
 @app.get("/faces")
 async def list_faces():
-    """List all known faces"""
     faces = []
     for f in KNOWN_FACES_DIR.glob("*.*"):
         if f.suffix.lower() in ['.jpg', '.jpeg', '.png']:
