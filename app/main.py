@@ -6,22 +6,19 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import gc
-import time
 
 # ============================================
-# EXTREME MEMORY OPTIMIZATION
+# MINIMAL SETUP
 # ============================================
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
-os.environ['TF_NUM_INTEROP_THREADS'] = '1'
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================
-# SIMPLIFIED DEEPFACE IMPORT
+# DEEPFACE IMPORT
 # ============================================
 DEEPFACE_AVAILABLE = False
 try:
@@ -47,15 +44,9 @@ KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-def force_cleanup():
-    """Aggressive memory cleanup"""
-    for _ in range(3):
-        gc.collect()
-        time.sleep(0.1)
-
 @app.get("/")
 async def root():
-    force_cleanup()
+    gc.collect()
     return {
         "message": "Missing Person API",
         "deepface": DEEPFACE_AVAILABLE,
@@ -64,7 +55,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    force_cleanup()
+    gc.collect()
     return {"status": "ok"}
 
 @app.post("/add-face-base64")
@@ -89,7 +80,7 @@ async def add_face(data: dict):
             f.write(img_data)
         
         logger.info(f"✅ Saved: {filename}")
-        force_cleanup()
+        gc.collect()
         
         return {"success": True}
         
@@ -99,15 +90,12 @@ async def add_face(data: dict):
 
 @app.post("/search-base64")
 async def search_face(data: dict):
-    """MEMORY SAFE SEARCH"""
+    """MINIMAL SEARCH - Maximum compatibility"""
     try:
         img = data.get('image')
         
         if not img:
             raise HTTPException(400, "No image")
-        
-        # Clean memory before starting
-        force_cleanup()
         
         # Save temp file
         img_data = base64.b64decode(img)
@@ -117,37 +105,34 @@ async def search_face(data: dict):
         
         if not DEEPFACE_AVAILABLE:
             os.remove(temp)
-            return []
+            return {"error": "DeepFace not available"}
         
         faces = list(KNOWN_FACES_DIR.glob("*.*"))
-        logger.info(f"Faces in DB: {len(faces)}")
+        logger.info(f"Faces: {len(faces)}")
         
         if len(faces) == 0:
             os.remove(temp)
             return []
         
-        # ===== SIMPLE SEARCH WITH MEMORY SAFETY =====
+        # ===== SIMPLEST POSSIBLE SEARCH =====
         results = []
         
         try:
             logger.info("🔄 Searching...")
             
-            # Use a separate process? No, but minimal options
+            # Only essential parameters
             dfs = DeepFace.find(
                 img_path=str(temp),
                 db_path=str(KNOWN_FACES_DIR),
                 model_name="Facenet512",
-                enforce_detection=False,
-                silent=True
+                enforce_detection=False
             )
             
             if len(dfs) > 0 and not dfs[0].empty:
-                logger.info(f"✅ Found matches")
-                
                 for _, row in dfs[0].iterrows():
                     sim = (1 - float(row['distance'])) * 100
                     
-                    # Simple name extraction
+                    # Get name from filename
                     fname = Path(row['identity']).name
                     parts = fname.split('_')[0].split('|')
                     
@@ -162,37 +147,21 @@ async def search_face(data: dict):
                     
         except Exception as e:
             logger.error(f"Search error: {e}")
+            return {"error": str(e)}
         
-        # Cleanup temp file
+        # Cleanup
         os.remove(temp)
+        gc.collect()
         
-        # Force memory cleanup
-        force_cleanup()
-        
-        if not results:
-            logger.info("❌ No matches")
-            return []
-        
-        # Simple dedup
-        seen = {}
-        for r in results:
-            if r['name'] not in seen or r['matchScore'] > seen[r['name']]['matchScore']:
-                seen[r['name']] = r
-        
-        final = list(seen.values())
-        final.sort(key=lambda x: x['matchScore'], reverse=True)
-        
-        logger.info(f"✅ Returning {len(final)} matches")
-        return final
+        return results
         
     except Exception as e:
         logger.error(f"❌ Error: {e}")
-        force_cleanup()
-        return []
+        return {"error": str(e)}
 
 @app.get("/faces")
 async def list_faces():
-    force_cleanup()
+    gc.collect()
     faces = []
     for f in KNOWN_FACES_DIR.glob("*.*"):
         parts = f.name.split('_')[0].split('|')
