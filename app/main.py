@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import gc
 import time
+import cv2
+import numpy as np
 
 # Set environment variables
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -29,6 +31,7 @@ try:
     tf.config.threading.set_intra_op_parallelism_threads(1)
     
     from deepface import DeepFace
+    from deepface.detectors import FaceDetector
     DEEPFACE_AVAILABLE = True
     logger.info("✅ DeepFace imported successfully")
 except Exception as e:
@@ -51,9 +54,56 @@ KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-def cleanup_memory():
-    gc.collect()
-    time.sleep(0.2)
+def check_face_detection(image_path):
+    """Check if face is detected in image"""
+    try:
+        # Try multiple detectors
+        detectors = ["opencv", "mtcnn", "retinaface"]
+        for detector in detectors:
+            try:
+                face_objs = DeepFace.extract_faces(
+                    img_path=str(image_path),
+                    detector_backend=detector,
+                    enforce_detection=False
+                )
+                if len(face_objs) > 0:
+                    logger.info(f"✅ Face detected with {detector}")
+                    return True
+            except:
+                continue
+        logger.warning("❌ No face detected in image")
+        return False
+    except Exception as e:
+        logger.warning(f"Face detection check failed: {e}")
+        return False
+
+def enhance_image(image_path):
+    """Enhance image for better face detection"""
+    try:
+        # Read image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return None
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        
+        # Convert back to BGR
+        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        
+        # Save enhanced image
+        enhanced_path = image_path.parent / f"enhanced_{image_path.name}"
+        cv2.imwrite(str(enhanced_path), enhanced_bgr)
+        
+        logger.info(f"✅ Image enhanced: {enhanced_path}")
+        return enhanced_path
+    except Exception as e:
+        logger.warning(f"Image enhancement failed: {e}")
+        return None
 
 @app.get("/")
 async def root():
@@ -95,6 +145,17 @@ async def add_face_base64(data: dict):
             buffer.write(image_data)
         
         logger.info(f"✅ File saved: {filename}")
+        
+        # Check if face is detectable in saved image
+        has_face = check_face_detection(file_path)
+        if not has_face:
+            # Try to enhance image
+            enhanced_path = enhance_image(file_path)
+            if enhanced_path:
+                # Replace with enhanced version
+                enhanced_path.replace(file_path)
+                logger.info("✅ Replaced with enhanced image")
+        
         return {"success": True, "message": "Face added successfully"}
     
     except Exception as e:
@@ -103,7 +164,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - SHOW ALL MATCHES FROM 20% TO 100%"""
+    """Search for a face - WITH FACE DETECTION VERIFICATION"""
     try:
         image_base64 = data.get('image')
         
@@ -120,39 +181,46 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return []
         
+        # Check if query image has detectable face
+        logger.info("🔍 Checking query image for face...")
+        has_face = check_face_detection(temp_path)
+        
+        if not has_face:
+            logger.warning("⚠️ No face detected in query image, trying enhancement...")
+            enhanced_path = enhance_image(temp_path)
+            if enhanced_path:
+                search_path = enhanced_path
+                logger.info("✅ Using enhanced image for search")
+            else:
+                search_path = temp_path
+        else:
+            search_path = temp_path
+        
         known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
         logger.info(f"Known faces count: {len(known_faces)}")
         
         if len(known_faces) == 0:
             os.remove(temp_path)
+            if enhanced_path and enhanced_path.exists():
+                os.remove(enhanced_path)
             return []
         
-        # ===== 6 MODELS - 20% THRESHOLD =====
+        # ===== TRY MULTIPLE DETECTORS =====
         all_matches = []
         
-        models_config = [
-            # (model_name, metric, min_similarity)
-            ("Facenet512", "cosine", 20),        # 20% similarity minimum
-            ("Facenet512", "euclidean_l2", 20),   # 20% similarity minimum
-            ("ArcFace", "cosine", 20),            # 20% similarity minimum
-            ("VGGFace", "cosine", 20),            # 20% similarity minimum
-            ("Dlib", "cosine", 20),               # 20% similarity minimum
-            ("OpenFace", "cosine", 20),           # 20% similarity minimum
-        ]
+        # Try different detectors
+        detectors = ["opencv", "mtcnn", "retinaface"]
         
-        detector = "opencv"
-        
-        for model_name, metric, min_sim in models_config:
+        for detector in detectors:
             try:
-                logger.info(f"🔄 Trying {model_name} with {metric}")
+                logger.info(f"🔄 Using detector: {detector}")
                 
-                cleanup_memory()
-                
+                # Try with Facenet512
                 dfs = DeepFace.find(
-                    img_path=str(temp_path),
+                    img_path=str(search_path),
                     db_path=str(KNOWN_FACES_DIR),
-                    model_name=model_name,
-                    distance_metric=metric,
+                    model_name="Facenet512",
+                    distance_metric="cosine",
                     detector_backend=detector,
                     enforce_detection=False,
                     silent=True,
@@ -160,17 +228,12 @@ async def search_face_base64(data: dict):
                 )
                 
                 if len(dfs) > 0 and not dfs[0].empty:
-                    logger.info(f"✅ {model_name} found {len(dfs[0])} matches")
+                    logger.info(f"✅ Facenet512 found matches with {detector}")
                     
                     for _, row in dfs[0].iterrows():
-                        # Calculate similarity
-                        if metric == "cosine":
-                            similarity = (1 - float(row['distance'])) * 100
-                        else:
-                            similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
+                        similarity = (1 - float(row['distance'])) * 100
                         
-                        # Include ALL matches (even 20% similarity)
-                        if similarity >= min_sim:
+                        if similarity >= 10:  # Extremely low threshold
                             # Extract metadata
                             db_path = Path(row['identity'])
                             filename_parts = db_path.name.split('_')
@@ -187,17 +250,16 @@ async def search_face_base64(data: dict):
                             }
                             
                             all_matches.append(person_info)
-                            logger.info(f"✅ Match: {similarity:.1f}% via {model_name}")
-                
-                del dfs
-                cleanup_memory()
-                
+                            logger.info(f"✅ Match: {similarity:.1f}%")
+                            
             except Exception as e:
-                logger.warning(f"{model_name} failed: {e}")
-                cleanup_memory()
+                logger.warning(f"Detector {detector} failed: {e}")
                 continue
         
+        # Clean up
         os.remove(temp_path)
+        if 'enhanced_path' in locals() and enhanced_path and enhanced_path.exists():
+            os.remove(enhanced_path)
         
         if not all_matches:
             logger.info("❌ No matches found")
@@ -213,7 +275,7 @@ async def search_face_base64(data: dict):
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        logger.info(f"✅ Returning {len(final_results)} matches (20% to 100%)")
+        logger.info(f"✅ Returning {len(final_results)} matches")
         return final_results
     
     except Exception as e:
