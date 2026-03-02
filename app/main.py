@@ -13,6 +13,7 @@ import gc
 import tempfile
 import json
 from datetime import datetime
+import requests
 
 # ============================================
 # MAXIMUM MEMORY OPTIMIZATION
@@ -38,7 +39,7 @@ except Exception as e:
     logger.error(f"❌ DeepFace import error: {e}")
 
 # ============================================
-# CLOUDINARY INIT
+# CLOUDINARY INITIALIZATION
 # ============================================
 try:
     cloudinary.config(
@@ -52,61 +53,94 @@ except Exception as e:
     logger.error(f"❌ Cloudinary error: {e}")
 
 # ============================================
-# FIREBASE INIT
+# FIREBASE INITIALIZATION
 # ============================================
 db = None
 try:
-    cred_dict = {
-        "type": "service_account",
-        "project_id": os.getenv("FIREBASE_PROJECT_ID"),
-        "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
-        "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-        "token_uri": "https://oauth2.googleapis.com/token"
-    }
+    # Get credentials from environment variables
+    project_id = os.getenv("FIREBASE_PROJECT_ID")
+    private_key = os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n')
+    client_email = os.getenv("FIREBASE_CLIENT_EMAIL")
     
-    if all([cred_dict["project_id"], cred_dict["private_key"], cred_dict["client_email"]]):
+    if project_id and private_key and client_email:
+        cred_dict = {
+            "type": "service_account",
+            "project_id": project_id,
+            "private_key": private_key,
+            "client_email": client_email,
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+        
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
         db = firestore.client()
-        logger.info("✅ Firebase connected")
+        logger.info("✅ Firebase connected successfully")
+        
+        # Test connection by trying to list collections
+        collections = list(db.collections())
+        logger.info(f"📁 Firebase collections: {len(collections)}")
     else:
         logger.warning("⚠️ Firebase credentials missing")
+        
 except Exception as e:
-    logger.error(f"❌ Firebase error: {e}")
+    logger.error(f"❌ Firebase initialization error: {e}")
 
-app = FastAPI(title="Missing Person API")
+# ============================================
+# FASTAPI APP
+# ============================================
+app = FastAPI(title="Missing Person Face Recognition API")
 
-# CORS
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ============================================
+# DIRECTORY SETUP
+# ============================================
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-def cleanup():
+# ============================================
+# UTILITY FUNCTIONS
+# ============================================
+def cleanup_memory():
+    """Force garbage collection"""
     gc.collect()
 
 # ============================================
-# API ENDPOINTS
+# ROOT ENDPOINT
 # ============================================
 @app.get("/")
 async def root():
-    cleanup()
+    cleanup_memory()
     return {
-        "message": "Missing Person API",
-        "deepface": DEEPFACE_AVAILABLE,
-        "firebase": db is not None
+        "message": "Missing Person Face Recognition API",
+        "status": "healthy",
+        "deepface_available": DEEPFACE_AVAILABLE,
+        "firebase_connected": db is not None,
+        "timestamp": str(uuid.uuid4())
     }
 
+# ============================================
+# HEALTH CHECK ENDPOINT
+# ============================================
 @app.get("/health")
-async def health():
-    cleanup()
-    return {"status": "ok"}
+async def health_check():
+    cleanup_memory()
+    return {
+        "status": "healthy",
+        "deepface_available": DEEPFACE_AVAILABLE,
+        "firebase_connected": db is not None
+    }
 
+# ============================================
+# ADD FACE ENDPOINT
+# ============================================
 @app.post("/add-face-base64")
 async def add_face_base64(data: dict):
     """Add face - saves to Cloudinary + Firebase"""
@@ -118,70 +152,108 @@ async def add_face_base64(data: dict):
         city = data.get('city')
         state = data.get('state')
         
+        # Validation
         if not image_base64:
-            raise HTTPException(400, "No image")
+            raise HTTPException(status_code=400, detail="No image provided")
+        
+        if not name or not age or not mobile or not city or not state:
+            raise HTTPException(status_code=400, detail="All fields are required")
+        
+        logger.info(f"📸 Adding face for: {name}")
         
         # Decode image
         image_data = base64.b64decode(image_base64)
         unique_id = str(uuid.uuid4())
-        public_id = f"{name}_{age}_{unique_id}".replace(" ", "_")
+        public_id = f"{name}_{age}_{unique_id}".replace(" ", "_").replace("|", "_")
         
         # Upload to Cloudinary
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-            tmp.write(image_data)
-            tmp_path = tmp.name
+        logger.info("☁️ Uploading to Cloudinary...")
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
+            tmp_file.write(image_data)
+            tmp_path = tmp_file.name
         
-        result = cloudinary.uploader.upload(
-            tmp_path,
-            public_id=public_id,
-            folder="missing_persons",
-            overwrite=True
-        )
-        os.unlink(tmp_path)
+        try:
+            result = cloudinary.uploader.upload(
+                tmp_path,
+                public_id=public_id,
+                folder="missing_persons",
+                overwrite=True,
+                resource_type="image"
+            )
+            image_url = result['secure_url']
+            logger.info(f"✅ Cloudinary upload successful: {image_url[:50]}...")
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         
         # Save to Firebase
         if db:
+            logger.info("🔥 Saving to Firebase...")
             doc_ref = db.collection('missing_persons').document(unique_id)
-            doc_ref.set({
+            doc_data = {
                 'name': name,
                 'age': age,
                 'mobile': mobile,
                 'city': city,
                 'state': state,
-                'image_url': result['secure_url'],
+                'image_url': image_url,
                 'timestamp': firestore.SERVER_TIMESTAMP
-            })
+            }
+            doc_ref.set(doc_data)
+            logger.info("✅ Firebase save successful")
+        else:
+            logger.warning("⚠️ Firebase not available, skipping database save")
         
-        cleanup()
-        logger.info(f"✅ Added: {name}")
+        cleanup_memory()
+        logger.info(f"✅ Person added successfully: {name}")
         
-        return {"success": True, "id": unique_id}
+        return {
+            "success": True,
+            "message": "Face added successfully",
+            "id": unique_id,
+            "image_url": image_url
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        cleanup()
-        raise HTTPException(500, str(e))
+        logger.error(f"❌ Error adding face: {e}")
+        cleanup_memory()
+        raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================
+# SEARCH FACE ENDPOINT
+# ============================================
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Lightweight search"""
+    """Search for a face in the database"""
     try:
         image_base64 = data.get('image')
         
         if not image_base64:
-            raise HTTPException(400, "No image")
+            raise HTTPException(status_code=400, detail="No image provided")
         
-        # Save search image
+        logger.info("🔍 Search request received")
+        
+        # Decode and save search image
         image_data = base64.b64decode(image_base64)
-        search_temp = TEMP_DIR / f"{uuid.uuid4()}.jpg"
+        search_temp = TEMP_DIR / f"search_{uuid.uuid4()}.jpg"
         with open(search_temp, "wb") as f:
             f.write(image_data)
         
-        if not DEEPFACE_AVAILABLE or not db:
+        # Check if DeepFace is available
+        if not DEEPFACE_AVAILABLE:
             os.unlink(search_temp)
-            return []
+            return {"error": "DeepFace not available"}
         
-        # Get all persons
+        # Check if Firebase is available
+        if not db:
+            os.unlink(search_temp)
+            return {"error": "Firebase not available"}
+        
+        # Get all persons from Firebase
+        logger.info("📊 Fetching persons from Firebase...")
         persons = []
         docs = db.collection('missing_persons').stream()
         for doc in docs:
@@ -189,91 +261,182 @@ async def search_face_base64(data: dict):
             data['id'] = doc.id
             persons.append(data)
         
+        logger.info(f"📊 Found {len(persons)} persons in database")
+        
         if not persons:
             os.unlink(search_temp)
             return []
         
-        # Compare with each person (one by one)
+        # Compare with each person
         results = []
-        import requests
         
-        for person in persons:
+        for idx, person in enumerate(persons):
             try:
-                # Download image
-                resp = requests.get(person['image_url'], timeout=5)
-                if resp.status_code != 200:
+                logger.info(f"🔄 Comparing with person {idx+1}/{len(persons)}: {person.get('name', 'Unknown')}")
+                
+                # Check if image_url exists
+                if 'image_url' not in person:
+                    logger.warning(f"⚠️ Person {person.get('name', 'Unknown')} has no image_url")
                     continue
                 
-                db_temp = TEMP_DIR / f"{uuid.uuid4()}.jpg"
+                # Download person's image from Cloudinary
+                resp = requests.get(person['image_url'], timeout=10)
+                if resp.status_code != 200:
+                    logger.warning(f"⚠️ Failed to download image for {person.get('name', 'Unknown')}")
+                    continue
+                
+                # Save to temp file
+                db_temp = TEMP_DIR / f"db_{uuid.uuid4()}.jpg"
                 with open(db_temp, "wb") as f:
                     f.write(resp.content)
                 
-                # Compare
-                dfs = DeepFace.find(
-                    img_path=str(search_temp),
-                    db_path=str(db_temp.parent),
-                    model_name="Facenet512",
-                    enforce_detection=False,
-                    silent=True
-                )
+                # Compare faces
+                try:
+                    dfs = DeepFace.find(
+                        img_path=str(search_temp),
+                        db_path=str(db_temp.parent),
+                        model_name="Facenet512",
+                        enforce_detection=False,
+                        silent=True
+                    )
+                    
+                    if len(dfs) > 0 and not dfs[0].empty:
+                        # Get the match for this specific image
+                        for _, row in dfs[0].iterrows():
+                            # Check if this match corresponds to our current person
+                            if str(db_temp) in str(row['identity']):
+                                similarity = (1 - float(row['distance'])) * 100
+                                if similarity >= 40:  # 40% threshold
+                                    results.append({
+                                        "name": person.get('name', 'Unknown'),
+                                        "age": person.get('age', ''),
+                                        "mobile": person.get('mobile', ''),
+                                        "city": person.get('city', ''),
+                                        "state": person.get('state', ''),
+                                        "matchScore": round(similarity, 2),
+                                        "photo_url": person.get('image_url', '')
+                                    })
+                                    logger.info(f"✅ Match found: {person.get('name')} - {similarity:.1f}%")
+                                break
+                except Exception as e:
+                    logger.warning(f"⚠️ Face comparison error for {person.get('name')}: {e}")
                 
-                if len(dfs) > 0 and not dfs[0].empty:
-                    sim = (1 - float(dfs[0].iloc[0]['distance'])) * 100
-                    if sim >= 40:
-                        results.append({
-                            "name": person['name'],
-                            "age": person['age'],
-                            "mobile": person['mobile'],
-                            "city": person['city'],
-                            "state": person['state'],
-                            "matchScore": round(sim, 2),
-                            "photo_url": person['image_url']
-                        })
+                # Clean up temp file
+                if os.path.exists(db_temp):
+                    os.unlink(db_temp)
                 
-                os.unlink(db_temp)
-                gc.collect()
+                # Periodic cleanup
+                if idx % 5 == 0:
+                    cleanup_memory()
                 
             except Exception as e:
-                logger.warning(f"Error: {e}")
+                logger.warning(f"⚠️ Error processing {person.get('name', 'Unknown')}: {e}")
                 continue
         
-        os.unlink(search_temp)
-        cleanup()
+        # Clean up search temp file
+        if os.path.exists(search_temp):
+            os.unlink(search_temp)
         
-        # Remove duplicates
+        # Remove duplicates and sort
         seen = set()
-        unique = []
+        unique_results = []
         for r in results:
-            if r['name'] not in seen:
-                seen.add(r['name'])
-                unique.append(r)
+            key = f"{r['name']}_{r['mobile']}"
+            if key not in seen:
+                seen.add(key)
+                unique_results.append(r)
         
-        unique.sort(key=lambda x: x['matchScore'], reverse=True)
-        return unique
+        unique_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
+        logger.info(f"✅ Found {len(unique_results)} unique matches")
+        cleanup_memory()
+        
+        return unique_results
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        cleanup()
-        return []
+        logger.error(f"❌ Search error: {e}")
+        cleanup_memory()
+        raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================
+# LIST FACES ENDPOINT
+# ============================================
 @app.get("/faces")
 async def list_faces():
-    if not db:
-        return {"faces": [], "count": 0}
-    
-    faces = []
-    docs = db.collection('missing_persons').stream()
-    for doc in docs:
-        data = doc.to_dict()
-        faces.append({
-            "id": doc.id,
-            "name": data.get('name'),
-            "age": data.get('age'),
-            "mobile": data.get('mobile'),
-            "city": data.get('city'),
-            "state": data.get('state'),
-            "photo_url": data.get('image_url')
-        })
-    
-    cleanup()
-    return {"faces": faces, "count": len(faces)}
+    """List all known faces from Firebase"""
+    try:
+        if not db:
+            return {"faces": [], "count": 0, "error": "Firebase not available"}
+        
+        logger.info("📋 Listing all faces from Firebase...")
+        
+        faces = []
+        docs = db.collection('missing_persons').stream()
+        for doc in docs:
+            data = doc.to_dict()
+            faces.append({
+                "id": doc.id,
+                "name": data.get('name', 'Unknown'),
+                "age": data.get('age', ''),
+                "mobile": data.get('mobile', ''),
+                "city": data.get('city', ''),
+                "state": data.get('state', ''),
+                "photo_url": data.get('image_url', ''),
+                "timestamp": str(data.get('timestamp', ''))
+            })
+        
+        logger.info(f"✅ Found {len(faces)} faces")
+        cleanup_memory()
+        
+        return {"faces": faces, "count": len(faces)}
+        
+    except Exception as e:
+        logger.error(f"❌ Error listing faces: {e}")
+        cleanup_memory()
+        return {"faces": [], "count": 0, "error": str(e)}
+
+# ============================================
+# DELETE FACE ENDPOINT
+# ============================================
+@app.delete("/face/{person_id}")
+async def delete_face(person_id: str):
+    """Delete a person from Firebase"""
+    try:
+        if not db:
+            raise HTTPException(status_code=503, detail="Firebase not available")
+        
+        logger.info(f"🗑️ Deleting person: {person_id}")
+        
+        # Get the document first to get image_url
+        doc_ref = db.collection('missing_persons').document(person_id)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Person not found")
+        
+        # Delete from Firebase
+        doc_ref.delete()
+        
+        logger.info(f"✅ Deleted person: {person_id}")
+        cleanup_memory()
+        
+        return {"success": True, "message": "Person deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error deleting face: {e}")
+        cleanup_memory()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# STARTUP EVENT
+# ============================================
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 Server starting...")
+    logger.info(f"📁 Temp directory: {TEMP_DIR}")
+    logger.info(f"🔥 Firebase connected: {db is not None}")
+    logger.info(f"🤖 DeepFace available: {DEEPFACE_AVAILABLE}")
