@@ -98,7 +98,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face using 4 different models - shows 40% to 100% matches"""
+    """Search for a face - shows ALL matches from 40% to 100%"""
     try:
         image_base64 = data.get('image')
         
@@ -123,69 +123,146 @@ async def search_face_base64(data: dict):
         # ===== 4 DIFFERENT MODELS WITH DIFFERENT THRESHOLDS =====
         all_matches = []
         
-        # Model configurations: (model_name, distance_metric, threshold)
-        models_config = [
-            # Model 1: Facenet512 - Most accurate, low threshold for 40% matches
-            ("Facenet512", "cosine", 0.20),
+        # Model 1: Facenet512 with very low threshold
+        try:
+            logger.info("🔄 Trying Facenet512 with threshold 0.20")
+            dfs = DeepFace.find(
+                img_path=str(temp_path),
+                db_path=str(KNOWN_FACES_DIR),
+                model_name="Facenet512",
+                distance_metric="cosine",
+                enforce_detection=False,
+                silent=True,
+                threshold=0.20,
+                align=True
+            )
             
-            # Model 2: ArcFace - Best for age-invariant, medium threshold
-            ("ArcFace", "cosine", 0.25),
-            
-            # Model 3: VGGFace - Good all-rounder
-            ("VGGFace", "cosine", 0.28),
-            
-            # Model 4: Facenet with Euclidean - Different metric for variety
-            ("Facenet512", "euclidean_l2", 0.7),
-        ]
-        
-        # Try each model configuration
-        for model_name, metric, threshold in models_config:
-            try:
-                logger.info(f"🔄 Trying {model_name} with {metric}, threshold={threshold}")
-                
-                dfs = DeepFace.find(
-                    img_path=str(temp_path),
-                    db_path=str(KNOWN_FACES_DIR),
-                    model_name=model_name,
-                    distance_metric=metric,
-                    enforce_detection=False,
-                    silent=True,
-                    threshold=threshold,
-                    align=True
-                )
-                
-                if len(dfs) > 0 and not dfs[0].empty:
-                    for _, row in dfs[0].iterrows():
-                        # Calculate similarity percentage
-                        if metric == "cosine":
-                            similarity = (1 - float(row['distance'])) * 100
-                        else:  # euclidean_l2
-                            similarity = max(0, min(100, 100 - (float(row['distance']) * 100)))
+            if len(dfs) > 0 and not dfs[0].empty:
+                for _, row in dfs[0].iterrows():
+                    similarity = (1 - float(row['distance'])) * 100
+                    if similarity >= 40:
+                        db_path = Path(row['identity'])
+                        filename_parts = db_path.name.split('_')
+                        metadata_str = filename_parts[0] if filename_parts else ""
+                        metadata_parts = metadata_str.split('|')
                         
-                        # Include ALL matches from 40% to 100%
-                        if similarity >= 40:
-                            # Extract metadata from filename
-                            db_path = Path(row['identity'])
-                            filename_parts = db_path.name.split('_')
-                            metadata_str = filename_parts[0] if filename_parts else ""
-                            metadata_parts = metadata_str.split('|')
-                            
-                            match_data = {
-                                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                                "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                                "matchScore": round(similarity, 2),
-                                "model": model_name  # Track which model found it
-                            }
-                            all_matches.append(match_data)
-                            
-                            logger.info(f"✅ Match: {match_data['name']} - {similarity:.1f}% (via {model_name})")
-                            
-            except Exception as e:
-                logger.warning(f"Model {model_name} failed: {e}")
-                continue
+                        all_matches.append({
+                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                            "matchScore": round(similarity, 2)
+                        })
+                        logger.info(f"✅ Facenet512 match: {similarity:.1f}%")
+        except Exception as e:
+            logger.warning(f"Facenet512 failed: {e}")
+        
+        # Model 2: ArcFace with low threshold
+        try:
+            logger.info("🔄 Trying ArcFace with threshold 0.25")
+            dfs = DeepFace.find(
+                img_path=str(temp_path),
+                db_path=str(KNOWN_FACES_DIR),
+                model_name="ArcFace",
+                distance_metric="cosine",
+                enforce_detection=False,
+                silent=True,
+                threshold=0.25,
+                align=True
+            )
+            
+            if len(dfs) > 0 and not dfs[0].empty:
+                for _, row in dfs[0].iterrows():
+                    similarity = (1 - float(row['distance'])) * 100
+                    if similarity >= 40:
+                        db_path = Path(row['identity'])
+                        filename_parts = db_path.name.split('_')
+                        metadata_str = filename_parts[0] if filename_parts else ""
+                        metadata_parts = metadata_str.split('|')
+                        
+                        all_matches.append({
+                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                            "matchScore": round(similarity, 2)
+                        })
+                        logger.info(f"✅ ArcFace match: {similarity:.1f}%")
+        except Exception as e:
+            logger.warning(f"ArcFace failed: {e}")
+        
+        # Model 3: VGGFace with medium threshold
+        try:
+            logger.info("🔄 Trying VGGFace with threshold 0.28")
+            dfs = DeepFace.find(
+                img_path=str(temp_path),
+                db_path=str(KNOWN_FACES_DIR),
+                model_name="VGGFace",
+                distance_metric="cosine",
+                enforce_detection=False,
+                silent=True,
+                threshold=0.28,
+                align=True
+            )
+            
+            if len(dfs) > 0 and not dfs[0].empty:
+                for _, row in dfs[0].iterrows():
+                    similarity = (1 - float(row['distance'])) * 100
+                    if similarity >= 40:
+                        db_path = Path(row['identity'])
+                        filename_parts = db_path.name.split('_')
+                        metadata_str = filename_parts[0] if filename_parts else ""
+                        metadata_parts = metadata_str.split('|')
+                        
+                        all_matches.append({
+                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                            "matchScore": round(similarity, 2)
+                        })
+                        logger.info(f"✅ VGGFace match: {similarity:.1f}%")
+        except Exception as e:
+            logger.warning(f"VGGFace failed: {e}")
+        
+        # Model 4: Facenet with Euclidean metric
+        try:
+            logger.info("🔄 Trying Facenet512 with euclidean_l2, threshold=0.7")
+            dfs = DeepFace.find(
+                img_path=str(temp_path),
+                db_path=str(KNOWN_FACES_DIR),
+                model_name="Facenet512",
+                distance_metric="euclidean_l2",
+                enforce_detection=False,
+                silent=True,
+                threshold=0.7,
+                align=True
+            )
+            
+            if len(dfs) > 0 and not dfs[0].empty:
+                for _, row in dfs[0].iterrows():
+                    distance = float(row['distance'])
+                    similarity = max(0, min(100, 100 - (distance * 100)))
+                    if similarity >= 40:
+                        db_path = Path(row['identity'])
+                        filename_parts = db_path.name.split('_')
+                        metadata_str = filename_parts[0] if filename_parts else ""
+                        metadata_parts = metadata_str.split('|')
+                        
+                        all_matches.append({
+                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                            "matchScore": round(similarity, 2)
+                        })
+                        logger.info(f"✅ Facenet512 (euclidean) match: {similarity:.1f}%")
+        except Exception as e:
+            logger.warning(f"Facenet512 euclidean failed: {e}")
         
         os.remove(temp_path)
         
@@ -200,14 +277,9 @@ async def search_face_base64(data: dict):
             if name not in unique_matches or match['matchScore'] > unique_matches[name]['matchScore']:
                 unique_matches[name] = match
         
-        # Convert to list and sort by score (highest first)
+        # Convert to list and sort by score
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
-        
-        # Remove model field before sending to client
-        for result in final_results:
-            if 'model' in result:
-                del result['model']
         
         logger.info(f"✅ Returning {len(final_results)} unique matches (40% to 100%)")
         return final_results
