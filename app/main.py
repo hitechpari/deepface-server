@@ -9,7 +9,7 @@ import gc
 import time
 
 # ============================================
-# EXTREME MEMORY OPTIMIZATION
+# MAXIMUM MEMORY OPTIMIZATION
 # ============================================
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -49,7 +49,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 def cleanup():
     gc.collect()
-    time.sleep(0.2)
+    time.sleep(0.3)  # More time for memory cleanup
 
 @app.get("/")
 async def root():
@@ -96,7 +96,7 @@ async def add_face(data: dict):
 
 @app.post("/search-base64")
 async def search_face(data: dict):
-    """ULTRA LIGHTWEIGHT SEARCH - SINGLE MODEL"""
+    """EXTREME LIGHTWEIGHT SEARCH"""
     try:
         img = data.get('image')
         
@@ -120,13 +120,13 @@ async def search_face(data: dict):
             os.remove(temp)
             return []
         
-        # ===== SINGLE MODEL, NO COMPLEX OPTIONS =====
+        # ===== SIMPLEST POSSIBLE SEARCH =====
         results = []
         
         try:
-            logger.info("🔄 Searching with Facenet512...")
+            logger.info("🔄 Searching...")
             
-            # Absolute minimal options
+            # Absolute minimum options - no extras
             dfs = DeepFace.find(
                 img_path=str(temp),
                 db_path=str(KNOWN_FACES_DIR),
@@ -136,20 +136,21 @@ async def search_face(data: dict):
             )
             
             if len(dfs) > 0 and not dfs[0].empty:
-                logger.info(f"✅ Found {len(dfs[0])} matches")
+                logger.info(f"✅ Found matches")
                 
                 for _, row in dfs[0].iterrows():
                     sim = (1 - float(row['distance'])) * 100
                     
-                    # Extract name from filename
-                    name_parts = Path(row['identity']).name.split('_')[0].split('|')
+                    # Simple name extraction
+                    fname = Path(row['identity']).name
+                    parts = fname.split('_')[0].split('|')
                     
                     results.append({
-                        "name": name_parts[0] if len(name_parts) > 0 else "Unknown",
-                        "age": name_parts[1] if len(name_parts) > 1 else "",
-                        "mobile": name_parts[2] if len(name_parts) > 2 else "",
-                        "city": name_parts[3] if len(name_parts) > 3 else "",
-                        "state": name_parts[4] if len(name_parts) > 4 else "",
+                        "name": parts[0] if len(parts) > 0 else "Unknown",
+                        "age": parts[1] if len(parts) > 1 else "",
+                        "mobile": parts[2] if len(parts) > 2 else "",
+                        "city": parts[3] if len(parts) > 3 else "",
+                        "state": parts[4] if len(parts) > 4 else "",
                         "matchScore": round(sim, 2)
                     })
                     
@@ -160,16 +161,17 @@ async def search_face(data: dict):
         os.remove(temp)
         cleanup()
         
-        # Remove duplicates
-        seen = set()
-        unique = []
+        # Simple dedup
+        seen = {}
         for r in results:
-            if r['name'] not in seen:
-                seen.add(r['name'])
-                unique.append(r)
+            if r['name'] not in seen or r['matchScore'] > seen[r['name']]['matchScore']:
+                seen[r['name']] = r
         
-        logger.info(f"✅ Returning {len(unique)} matches")
-        return unique
+        final = list(seen.values())
+        final.sort(key=lambda x: x['matchScore'], reverse=True)
+        
+        logger.info(f"✅ Returning {len(final)} matches")
+        return final
         
     except Exception as e:
         logger.error(f"❌ Error: {e}")
@@ -179,9 +181,9 @@ async def search_face(data: dict):
 async def list_faces():
     faces = []
     for f in KNOWN_FACES_DIR.glob("*.*"):
-        name_parts = f.name.split('_')[0].split('|')
+        parts = f.name.split('_')[0].split('|')
         faces.append({
             "filename": f.name,
-            "name": name_parts[0] if len(name_parts) > 0 else "Unknown"
+            "name": parts[0] if len(parts) > 0 else "Unknown"
         })
     return {"faces": faces, "count": len(faces)}
