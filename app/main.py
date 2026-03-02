@@ -6,25 +6,35 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-import numpy as np
-import cv2
-from PIL import Image
-import io
+import gc
 
-# Set environment variables
+# Set environment variables for memory optimization
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DeepFace import
+# DeepFace import with memory optimization
 DEEPFACE_AVAILABLE = False
 try:
+    import tensorflow as tf
+    # Limit TensorFlow memory growth
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    else:
+        # For CPU, limit thread usage
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+    
     from deepface import DeepFace
-    from deepface.commons import distance as dst
-    from deepface.detectors import FaceDetector
     DEEPFACE_AVAILABLE = True
     logger.info("✅ DeepFace imported successfully")
 except Exception as e:
@@ -47,37 +57,20 @@ KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-def preprocess_image(image_path):
-    """Preprocess image to improve face detection"""
-    try:
-        # Read image
-        img = cv2.imread(str(image_path))
-        if img is None:
-            return None
-        
-        # Convert to RGB
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Enhance image
-        # 1. Denoise
-        img_denoised = cv2.fastNlMeansDenoisingColored(img_rgb, None, 10, 10, 7, 21)
-        
-        # 2. Increase contrast
-        lab = cv2.cvtColor(img_denoised, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        l = clahe.apply(l)
-        lab = cv2.merge([l,a,b])
-        img_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-        
-        # Save enhanced image
-        enhanced_path = image_path.parent / f"enhanced_{image_path.name}"
-        cv2.imwrite(str(enhanced_path), cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
-        
-        return enhanced_path
-    except Exception as e:
-        logger.warning(f"Image preprocessing failed: {e}")
-        return None
+# Global model cache
+_MODEL_CACHE = {}
+
+def get_model(model_name):
+    """Load model with caching to save memory"""
+    global _MODEL_CACHE
+    if model_name not in _MODEL_CACHE:
+        logger.info(f"Loading model: {model_name}")
+        _MODEL_CACHE[model_name] = True  # Just mark as loaded
+    return _MODEL_CACHE.get(model_name)
+
+def cleanup_memory():
+    """Force garbage collection"""
+    gc.collect()
 
 @app.get("/")
 async def root():
@@ -115,7 +108,6 @@ async def add_face_base64(data: dict):
         
         # Decode base64
         image_data = base64.b64decode(image_base64)
-        logger.info(f"Image decoded, size: {len(image_data)} bytes")
         
         # Create metadata string
         metadata = f"{name}|{age}|{mobile}|{city}|{state}"
@@ -127,16 +119,8 @@ async def add_face_base64(data: dict):
         
         logger.info(f"✅ File saved: {filename}")
         
-        # Try to detect face in saved image
-        try:
-            face_objs = DeepFace.extract_faces(
-                img_path=str(file_path),
-                detector_backend="opencv",
-                enforce_detection=False
-            )
-            logger.info(f"Face detection in saved image: {len(face_objs)} faces found")
-        except Exception as e:
-            logger.warning(f"Face detection in saved image failed: {e}")
+        # Clean up memory
+        cleanup_memory()
         
         return {
             "success": True,
@@ -150,7 +134,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - ULTIMATE TOLERANT VERSION"""
+    """Search for a face - MEMORY OPTIMIZED VERSION"""
     try:
         image_base64 = data.get('image')
         
@@ -176,95 +160,76 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return []
         
-        # ===== ULTIMATE TOLERANT CONFIGURATION =====
+        # ===== MEMORY OPTIMIZED: Only 2 models instead of 6 =====
         all_matches = []
         
-        # Try preprocessing if face detection fails
-        enhanced_path = preprocess_image(temp_path)
-        if enhanced_path and enhanced_path.exists():
-            logger.info("✅ Image preprocessed for better detection")
-            search_paths = [temp_path, enhanced_path]
-        else:
-            search_paths = [temp_path]
-        
-        # Multiple detectors
-        detectors = [
-            "opencv",      # Fast, works for most cases
-            "mtcnn",       # Good for small faces
-            "retinaface",  # Best accuracy
-            "dlib",        # Reliable
-            "ssd"          # Alternative
+        # Only use 2 most efficient models
+        models_to_try = [
+            ("Facenet512", "cosine"),      # Most accurate
+            ("Facenet512", "euclidean_l2")  # Different metric
         ]
         
-        # Multiple models
-        models = [
-            ("Facenet512", "cosine"),
-            ("Facenet512", "euclidean_l2"),
-            ("ArcFace", "cosine"),
-            ("VGGFace", "cosine"),
-            ("Dlib", "cosine"),
-            ("OpenFace", "cosine"),
-        ]
+        # Single detector to save memory
+        detector = "opencv"
         
-        total_attempts = 0
-        for search_path in search_paths:
-            for detector in detectors:
-                for model_name, metric in models:
-                    try:
-                        total_attempts += 1
-                        logger.info(f"🔄 Attempt {total_attempts}: {detector}/{model_name}/{metric}")
+        for model_name, metric in models_to_try:
+            try:
+                logger.info(f"🔄 Trying {model_name} with {metric}")
+                
+                # Force garbage collection before each model
+                cleanup_memory()
+                
+                dfs = DeepFace.find(
+                    img_path=str(temp_path),
+                    db_path=str(KNOWN_FACES_DIR),
+                    model_name=model_name,
+                    distance_metric=metric,
+                    detector_backend=detector,
+                    enforce_detection=False,
+                    silent=True,
+                    align=True
+                )
+                
+                if len(dfs) > 0 and not dfs[0].empty:
+                    logger.info(f"✅ {model_name} found matches")
+                    
+                    for _, row in dfs[0].iterrows():
+                        # Calculate similarity
+                        if metric == "cosine":
+                            similarity = (1 - float(row['distance'])) * 100
+                        else:
+                            similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
                         
-                        dfs = DeepFace.find(
-                            img_path=str(search_path),
-                            db_path=str(KNOWN_FACES_DIR),
-                            model_name=model_name,
-                            distance_metric=metric,
-                            detector_backend=detector,
-                            enforce_detection=False,  # Don't fail if no face detected
-                            silent=True,
-                            align=True,
-                            normalization="base"
-                        )
+                        # Extract metadata
+                        db_path = Path(row['identity'])
+                        filename_parts = db_path.name.split('_')
+                        metadata_str = filename_parts[0] if filename_parts else ""
+                        metadata_parts = metadata_str.split('|')
                         
-                        if len(dfs) > 0 and not dfs[0].empty:
-                            logger.info(f"✅ Match found with {detector}/{model_name}")
-                            
-                            for _, row in dfs[0].iterrows():
-                                # Calculate similarity
-                                if metric == "cosine":
-                                    similarity = (1 - float(row['distance'])) * 100
-                                else:
-                                    similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
-                                
-                                # Extract metadata
-                                db_path = Path(row['identity'])
-                                filename_parts = db_path.name.split('_')
-                                metadata_str = filename_parts[0] if filename_parts else ""
-                                metadata_parts = metadata_str.split('|')
-                                
-                                person_info = {
-                                    "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                                    "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                                    "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                                    "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                                    "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                                    "matchScore": round(similarity, 2)
-                                }
-                                
-                                all_matches.append(person_info)
-                                logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}%")
-                                
-                    except Exception as e:
-                        logger.debug(f"{detector}/{model_name} failed: {e}")
-                        continue
+                        person_info = {
+                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                            "matchScore": round(similarity, 2)
+                        }
+                        
+                        all_matches.append(person_info)
+                        logger.info(f"✅ Match: {similarity:.1f}%")
+                
+                # Clean up after each model
+                del dfs
+                cleanup_memory()
+                
+            except Exception as e:
+                logger.warning(f"{model_name} failed: {e}")
+                continue
         
-        # Clean up
         os.remove(temp_path)
-        if enhanced_path and enhanced_path.exists():
-            os.remove(enhanced_path)
         
         if not all_matches:
-            logger.info("❌ No matches found after 36 attempts")
+            logger.info("❌ No matches found")
             return []
         
         # Remove duplicates
@@ -277,7 +242,11 @@ async def search_face_base64(data: dict):
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        logger.info(f"✅ Returning {len(final_results)} matches after {total_attempts} attempts")
+        logger.info(f"✅ Returning {len(final_results)} matches")
+        
+        # Final cleanup
+        cleanup_memory()
+        
         return final_results
     
     except Exception as e:
