@@ -1,108 +1,114 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import shutil
 import os
-from pathlib import Path
+import logging
 import uuid
 import base64
-from PIL import Image
-import io
-import numpy as np
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import cloudinary
+import cloudinary.uploader
+from datetime import datetime
+import gc
+import tempfile
 
-# DeepFace import with error handling
+# ============================================
+# ENVIRONMENT SETUP
+# ============================================
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Cloudinary Configuration
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# DeepFace import
+DEEPFACE_AVAILABLE = False
 try:
     from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
-except ImportError as e:
-    print(f"DeepFace import error: {e}")
-    DEEPFACE_AVAILABLE = False
+    logger.info("✅ DeepFace imported")
+except Exception as e:
+    logger.error(f"❌ DeepFace import error: {e}")
 
-app = FastAPI(title="Missing Person Face Recognition API")
+app = FastAPI(title="Missing Person API")
 
-# CORS setup - Allow all origins (for Google Apps Script)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Known faces directory
-KNOWN_FACES_DIR = Path("app/known_faces")
-KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
-
-# Temporary directory for uploads
+# Temporary directory for processing
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# ============================================
+# DATABASE: Cloudinary URLs store karenge
+# ============================================
+# Ab hum filesystem use nahi karenge, sirf Cloudinary
+# Photos Cloudinary par save hongi aur unke URLs
+# is dictionary mein store honge (in-memory)
+# NOTE: Real app mein yeh database (PostgreSQL/MongoDB) use karo
+face_database = {}  # { "filename": { "url": "...", "metadata": {...} } }
+
+# ============================================
+# CLOUDINARY FUNCTIONS
+# ============================================
+async def upload_to_cloudinary(image_data: bytes, public_id: str) -> str:
+    """Upload image to Cloudinary and return URL"""
+    try:
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
+            tmp_file.write(image_data)
+            tmp_path = tmp_file.name
+        
+        # Upload to Cloudinary
+        result = cloudinary.uploader.upload(
+            tmp_path,
+            public_id=public_id,
+            folder="missing_persons",
+            overwrite=True,
+            resource_type="image"
+        )
+        
+        # Clean up temp file
+        os.unlink(tmp_path)
+        
+        logger.info(f"✅ Uploaded to Cloudinary: {result['secure_url']}")
+        return result['secure_url']
+        
+    except Exception as e:
+        logger.error(f"❌ Cloudinary upload error: {e}")
+        raise
+
+# ============================================
+# API ENDPOINTS
+# ============================================
 @app.get("/")
 async def root():
     return {
-        "message": "Missing Person Face Recognition API",
-        "status": "healthy",
-        "deepface_available": DEEPFACE_AVAILABLE,
-        "known_faces_count": len(list(KNOWN_FACES_DIR.glob("*.*")))
+        "message": "Missing Person API with Cloudinary",
+        "deepface": DEEPFACE_AVAILABLE,
+        "faces_in_db": len(face_database)
     }
 
 @app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "deepface_available": DEEPFACE_AVAILABLE,
-        "timestamp": str(uuid.uuid4())
-    }
-
-@app.post("/add-face")
-async def add_face(
-    file: UploadFile = File(...),
-    name: str = None,
-    age: str = None,
-    mobile: str = None,
-    city: str = None,
-    state: str = None
-):
-    """Add a new face to the database with metadata"""
-    try:
-        # Validate file type
-        if not file.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        # Generate filename with metadata
-        file_extension = file.filename.split(".")[-1].lower()
-        if file_extension not in ['jpg', 'jpeg', 'png']:
-            file_extension = 'jpg'
-        
-        # Create metadata string
-        metadata = f"{name}|{age}|{mobile}|{city}|{state}"
-        filename = f"{metadata}_{uuid.uuid4()}.{file_extension}"
-        
-        file_path = KNOWN_FACES_DIR / filename
-        
-        # Save file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        return {
-            "success": True,
-            "message": "Face added successfully",
-            "filename": filename,
-            "metadata": {
-                "name": name,
-                "age": age,
-                "mobile": mobile,
-                "city": city,
-                "state": state
-            }
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def health():
+    gc.collect()
+    return {"status": "ok"}
 
 @app.post("/add-face-base64")
 async def add_face_base64(data: dict):
-    """Add face from base64 image"""
+    """Add face - saves to Cloudinary"""
     try:
         image_base64 = data.get('image')
         name = data.get('name')
@@ -112,211 +118,144 @@ async def add_face_base64(data: dict):
         state = data.get('state')
         
         if not image_base64:
-            raise HTTPException(status_code=400, detail="No image provided")
+            raise HTTPException(400, "No image")
         
-        # Decode base64
+        # Decode image
         image_data = base64.b64decode(image_base64)
         
-        # Create metadata string
-        metadata = f"{name}|{age}|{mobile}|{city}|{state}"
-        filename = f"{metadata}_{uuid.uuid4()}.jpg"
+        # Create unique ID
+        unique_id = str(uuid.uuid4())
+        public_id = f"{name}_{age}_{unique_id}".replace(" ", "_")
         
-        file_path = KNOWN_FACES_DIR / filename
+        # Upload to Cloudinary
+        image_url = await upload_to_cloudinary(image_data, public_id)
         
-        # Save file
-        with open(file_path, "wb") as buffer:
-            buffer.write(image_data)
+        # Store metadata with URL
+        filename = f"{name}|{age}|{mobile}|{city}|{state}_{unique_id}.jpg"
+        face_database[filename] = {
+            "url": image_url,
+            "name": name,
+            "age": age,
+            "mobile": mobile,
+            "city": city,
+            "state": state,
+            "filename": filename
+        }
+        
+        logger.info(f"✅ Face added: {filename}")
+        logger.info(f"📸 Cloudinary URL: {image_url}")
         
         return {
             "success": True,
             "message": "Face added successfully",
-            "filename": filename
+            "filename": filename,
+            "cloudinary_url": image_url
         }
-    
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/search")
-async def search_face(file: UploadFile = File(...)):
-    """Search for a face in the database"""
-    try:
-        if not DEEPFACE_AVAILABLE:
-            return {
-                "matched": False,
-                "error": "DeepFace not available",
-                "fallback": True,
-                "message": "Using basic hash matching"
-            }
-        
-        # Save temporary file
-        temp_path = TEMP_DIR / f"{uuid.uuid4()}.jpg"
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Get list of known faces
-        known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
-        
-        if len(known_faces) == 0:
-            os.remove(temp_path)
-            return {"matched": False, "message": "No faces in database"}
-        
-        # Find matches using DeepFace
-        try:
-            result = DeepFace.find(
-                img_path=str(temp_path),
-                db_path=str(KNOWN_FACES_DIR),
-                model_name="Facenet512",
-                distance_metric="cosine",
-                enforce_detection=False,
-                silent=True
-            )
-        except Exception as deepface_error:
-            print(f"DeepFace error: {deepface_error}")
-            os.remove(temp_path)
-            return {
-                "matched": False,
-                "error": str(deepface_error),
-                "fallback": True
-            }
-        
-        # Clean up
-        os.remove(temp_path)
-        
-        if len(result) > 0 and not result[0].empty:
-            # Match found
-            match = result[0].iloc[0]
-            identity_path = Path(match['identity'])
-            
-            # Extract metadata from filename
-            filename_parts = identity_path.name.split('_')
-            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
-            metadata_parts = metadata_str.split('|')
-            
-            person_info = {
-                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                "state": metadata_parts[4] if len(metadata_parts) > 4 else ""
-            }
-            
-            similarity = (1 - float(match['distance'])) * 100
-            
-            return {
-                "matched": True,
-                "identity": identity_path.name,
-                "person_info": person_info,
-                "distance": float(match['distance']),
-                "similarity": f"{similarity:.2f}%",
-                "match_score": round(similarity, 2)
-            }
-        else:
-            return {"matched": False, "message": "No match found"}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Error: {e}")
+        raise HTTPException(500, str(e))
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face from base64 image"""
+    """Search face - downloads from Cloudinary for comparison"""
     try:
         image_base64 = data.get('image')
         
         if not image_base64:
-            raise HTTPException(status_code=400, detail="No image provided")
+            raise HTTPException(400, "No image")
         
-        # Decode base64
-        image_data = base64.b64decode(image_base64)
+        # Decode search image
+        search_image_data = base64.b64decode(image_base64)
+        search_temp = TEMP_DIR / f"search_{uuid.uuid4()}.jpg"
+        with open(search_temp, "wb") as f:
+            f.write(search_image_data)
         
-        # Save temporary file
-        temp_path = TEMP_DIR / f"{uuid.uuid4()}.jpg"
-        with open(temp_path, "wb") as buffer:
-            buffer.write(image_data)
-        
-        # Reuse search logic
         if not DEEPFACE_AVAILABLE:
-            os.remove(temp_path)
-            return {
-                "matched": False,
-                "error": "DeepFace not available",
-                "fallback": True
-            }
+            os.remove(search_temp)
+            return {"error": "DeepFace not available"}
         
-        known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
+        if len(face_database) == 0:
+            os.remove(search_temp)
+            return []
         
-        if len(known_faces) == 0:
-            os.remove(temp_path)
-            return {"matched": False, "message": "No faces in database"}
+        # Download all faces from Cloudinary to temp for comparison
+        results = []
         
-        try:
-            result = DeepFace.find(
-                img_path=str(temp_path),
-                db_path=str(KNOWN_FACES_DIR),
-                model_name="Facenet512",
-                distance_metric="cosine",
-                enforce_detection=False,
-                silent=True
-            )
-        except Exception as deepface_error:
-            os.remove(temp_path)
-            return {
-                "matched": False,
-                "error": str(deepface_error),
-                "fallback": True
-            }
+        for filename, data in face_database.items():
+            try:
+                # Download image from Cloudinary
+                import requests
+                img_response = requests.get(data['url'])
+                if img_response.status_code == 200:
+                    db_temp = TEMP_DIR / f"db_{uuid.uuid4()}.jpg"
+                    with open(db_temp, "wb") as f:
+                        f.write(img_response.content)
+                    
+                    # Compare faces
+                    dfs = DeepFace.find(
+                        img_path=str(search_temp),
+                        db_path=str(db_temp.parent),  # Directory containing temp file
+                        model_name="Facenet512",
+                        enforce_detection=False,
+                        silent=True
+                    )
+                    
+                    if len(dfs) > 0 and not dfs[0].empty:
+                        for _, row in dfs[0].iterrows():
+                            similarity = (1 - float(row['distance'])) * 100
+                            if similarity >= 40:
+                                results.append({
+                                    "name": data['name'],
+                                    "age": data['age'],
+                                    "mobile": data['mobile'],
+                                    "city": data['city'],
+                                    "state": data['state'],
+                                    "matchScore": round(similarity, 2),
+                                    "photo_url": data['url']
+                                })
+                    
+                    # Clean up temp db file
+                    os.unlink(db_temp)
+                    
+            except Exception as e:
+                logger.warning(f"Error processing {filename}: {e}")
+                continue
         
-        os.remove(temp_path)
+        # Clean up search temp file
+        os.unlink(search_temp)
+        gc.collect()
         
-        if len(result) > 0 and not result[0].empty:
-            match = result[0].iloc[0]
-            identity_path = Path(match['identity'])
-            
-            filename_parts = identity_path.name.split('_')
-            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
-            metadata_parts = metadata_str.split('|')
-            
-            person_info = {
-                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                "state": metadata_parts[4] if len(metadata_parts) > 4 else ""
-            }
-            
-            similarity = (1 - float(match['distance'])) * 100
-            
-            return {
-                "matched": True,
-                "identity": identity_path.name,
-                "person_info": person_info,
-                "similarity": f"{similarity:.2f}%",
-                "match_score": round(similarity, 2)
-            }
-        else:
-            return {"matched": False, "message": "No match found"}
-    
+        # Remove duplicates
+        seen = set()
+        unique_results = []
+        for r in results:
+            if r['name'] not in seen:
+                seen.add(r['name'])
+                unique_results.append(r)
+        
+        unique_results.sort(key=lambda x: x['matchScore'], reverse=True)
+        
+        logger.info(f"✅ Found {len(unique_results)} matches")
+        return unique_results
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Search error: {e}")
+        return []
 
 @app.get("/faces")
 async def list_faces():
-    """List all known faces with metadata"""
+    """List all faces from Cloudinary"""
     faces = []
-    for f in KNOWN_FACES_DIR.glob("*.*"):
-        if f.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-            filename_parts = f.name.split('_')
-            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
-            metadata_parts = metadata_str.split('|')
-            
-            face_info = {
-                "filename": f.name,
-                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                "size": f.stat().st_size
-            }
-            faces.append(face_info)
+    for filename, data in face_database.items():
+        faces.append({
+            "filename": filename,
+            "name": data['name'],
+            "age": data['age'],
+            "mobile": data['mobile'],
+            "city": data['city'],
+            "state": data['state'],
+            "cloudinary_url": data['url']
+        })
     
     return {"faces": faces, "count": len(faces)}
