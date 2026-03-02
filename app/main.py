@@ -7,9 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import cloudinary
 import cloudinary.uploader
+import firebase_admin
+from firebase_admin import credentials, firestore
 from datetime import datetime
 import gc
 import tempfile
+import json
 
 # ============================================
 # ENVIRONMENT SETUP
@@ -17,18 +20,47 @@ import tempfile
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# Cloudinary Configuration
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True
-)
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DeepFace import
+# ============================================
+# FIREBASE INITIALIZATION
+# ============================================
+try:
+    # Firebase credentials from environment
+    firebase_cred = {
+        "type": "service_account",
+        "project_id": os.getenv("FIREBASE_PROJECT_ID"),
+        "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace('\\n', '\n'),
+        "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+        "token_uri": "https://oauth2.googleapis.com/token"
+    }
+    
+    cred = credentials.Certificate(firebase_cred)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logger.info("✅ Firebase initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Firebase init error: {e}")
+    db = None
+
+# ============================================
+# CLOUDINARY INITIALIZATION
+# ============================================
+try:
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.getenv("CLOUDINARY_API_KEY"),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        secure=True
+    )
+    logger.info("✅ Cloudinary initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Cloudinary init error: {e}")
+
+# ============================================
+# DEEPFACE IMPORT
+# ============================================
 DEEPFACE_AVAILABLE = False
 try:
     from deepface import DeepFace
@@ -47,18 +79,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Temporary directory for processing
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================
-# DATABASE: Cloudinary URLs store karenge
+# FIREBASE DATABASE FUNCTIONS
 # ============================================
-# Ab hum filesystem use nahi karenge, sirf Cloudinary
-# Photos Cloudinary par save hongi aur unke URLs
-# is dictionary mein store honge (in-memory)
-# NOTE: Real app mein yeh database (PostgreSQL/MongoDB) use karo
-face_database = {}  # { "filename": { "url": "...", "metadata": {...} } }
+async def save_to_firebase(person_data: dict, image_url: str):
+    """Save person data to Firebase Firestore"""
+    try:
+        doc_ref = db.collection('missing_persons').document(person_data['id'])
+        doc_ref.set({
+            'name': person_data['name'],
+            'age': person_data['age'],
+            'mobile': person_data['mobile'],
+            'city': person_data['city'],
+            'state': person_data['state'],
+            'image_url': image_url,
+            'timestamp': firestore.SERVER_TIMESTAMP,
+            'filename': person_data['filename']
+        })
+        logger.info(f"✅ Saved to Firebase: {person_data['id']}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Firebase save error: {e}")
+        return False
+
+async def get_all_from_firebase():
+    """Get all persons from Firebase"""
+    try:
+        persons = []
+        docs = db.collection('missing_persons').stream()
+        for doc in docs:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            persons.append(data)
+        logger.info(f"✅ Retrieved {len(persons)} from Firebase")
+        return persons
+    except Exception as e:
+        logger.error(f"❌ Firebase read error: {e}")
+        return []
+
+async def get_person_by_id(person_id: str):
+    """Get specific person from Firebase"""
+    try:
+        doc = db.collection('missing_persons').document(person_id).get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"❌ Firebase get error: {e}")
+        return None
 
 # ============================================
 # CLOUDINARY FUNCTIONS
@@ -66,12 +137,10 @@ face_database = {}  # { "filename": { "url": "...", "metadata": {...} } }
 async def upload_to_cloudinary(image_data: bytes, public_id: str) -> str:
     """Upload image to Cloudinary and return URL"""
     try:
-        # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
             tmp_file.write(image_data)
             tmp_path = tmp_file.name
         
-        # Upload to Cloudinary
         result = cloudinary.uploader.upload(
             tmp_path,
             public_id=public_id,
@@ -80,10 +149,8 @@ async def upload_to_cloudinary(image_data: bytes, public_id: str) -> str:
             resource_type="image"
         )
         
-        # Clean up temp file
         os.unlink(tmp_path)
-        
-        logger.info(f"✅ Uploaded to Cloudinary: {result['secure_url']}")
+        logger.info(f"✅ Uploaded to Cloudinary")
         return result['secure_url']
         
     except Exception as e:
@@ -95,20 +162,26 @@ async def upload_to_cloudinary(image_data: bytes, public_id: str) -> str:
 # ============================================
 @app.get("/")
 async def root():
+    persons = await get_all_from_firebase()
     return {
-        "message": "Missing Person API with Cloudinary",
+        "message": "Missing Person API with Firebase",
         "deepface": DEEPFACE_AVAILABLE,
-        "faces_in_db": len(face_database)
+        "firebase_connected": db is not None,
+        "faces_in_db": len(persons)
     }
 
 @app.get("/health")
 async def health():
     gc.collect()
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "firebase": db is not None,
+        "deepface": DEEPFACE_AVAILABLE
+    }
 
 @app.post("/add-face-base64")
 async def add_face_base64(data: dict):
-    """Add face - saves to Cloudinary"""
+    """Add face - saves to Cloudinary + Firebase"""
     try:
         image_base64 = data.get('image')
         name = data.get('name')
@@ -125,30 +198,31 @@ async def add_face_base64(data: dict):
         
         # Create unique ID
         unique_id = str(uuid.uuid4())
+        filename = f"{name}|{age}|{mobile}|{city}|{state}_{unique_id}.jpg"
         public_id = f"{name}_{age}_{unique_id}".replace(" ", "_")
         
         # Upload to Cloudinary
         image_url = await upload_to_cloudinary(image_data, public_id)
         
-        # Store metadata with URL
-        filename = f"{name}|{age}|{mobile}|{city}|{state}_{unique_id}.jpg"
-        face_database[filename] = {
-            "url": image_url,
-            "name": name,
-            "age": age,
-            "mobile": mobile,
-            "city": city,
-            "state": state,
-            "filename": filename
+        # Save to Firebase
+        person_data = {
+            'id': unique_id,
+            'name': name,
+            'age': age,
+            'mobile': mobile,
+            'city': city,
+            'state': state,
+            'filename': filename
         }
         
-        logger.info(f"✅ Face added: {filename}")
-        logger.info(f"📸 Cloudinary URL: {image_url}")
+        await save_to_firebase(person_data, image_url)
+        
+        logger.info(f"✅ Person added: {name}")
         
         return {
             "success": True,
             "message": "Face added successfully",
-            "filename": filename,
+            "id": unique_id,
             "cloudinary_url": image_url
         }
         
@@ -158,7 +232,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search face - downloads from Cloudinary for comparison"""
+    """Search face - compares with all Firebase entries"""
     try:
         image_base64 = data.get('image')
         
@@ -171,22 +245,25 @@ async def search_face_base64(data: dict):
         with open(search_temp, "wb") as f:
             f.write(search_image_data)
         
-        if not DEEPFACE_AVAILABLE:
+        if not DEEPFACE_AVAILABLE or db is None:
             os.remove(search_temp)
-            return {"error": "DeepFace not available"}
+            return {"error": "Services not available"}
         
-        if len(face_database) == 0:
+        # Get all persons from Firebase
+        persons = await get_all_from_firebase()
+        
+        if len(persons) == 0:
             os.remove(search_temp)
             return []
         
-        # Download all faces from Cloudinary to temp for comparison
+        # Download and compare each face
         results = []
         
-        for filename, data in face_database.items():
+        for person in persons:
             try:
                 # Download image from Cloudinary
                 import requests
-                img_response = requests.get(data['url'])
+                img_response = requests.get(person['image_url'])
                 if img_response.status_code == 200:
                     db_temp = TEMP_DIR / f"db_{uuid.uuid4()}.jpg"
                     with open(db_temp, "wb") as f:
@@ -195,7 +272,7 @@ async def search_face_base64(data: dict):
                     # Compare faces
                     dfs = DeepFace.find(
                         img_path=str(search_temp),
-                        db_path=str(db_temp.parent),  # Directory containing temp file
+                        db_path=str(db_temp.parent),
                         model_name="Facenet512",
                         enforce_detection=False,
                         silent=True
@@ -206,23 +283,22 @@ async def search_face_base64(data: dict):
                             similarity = (1 - float(row['distance'])) * 100
                             if similarity >= 40:
                                 results.append({
-                                    "name": data['name'],
-                                    "age": data['age'],
-                                    "mobile": data['mobile'],
-                                    "city": data['city'],
-                                    "state": data['state'],
+                                    "name": person['name'],
+                                    "age": person['age'],
+                                    "mobile": person['mobile'],
+                                    "city": person['city'],
+                                    "state": person['state'],
                                     "matchScore": round(similarity, 2),
-                                    "photo_url": data['url']
+                                    "photo_url": person['image_url']
                                 })
                     
-                    # Clean up temp db file
                     os.unlink(db_temp)
                     
             except Exception as e:
-                logger.warning(f"Error processing {filename}: {e}")
+                logger.warning(f"Error processing {person.get('name')}: {e}")
                 continue
         
-        # Clean up search temp file
+        # Cleanup
         os.unlink(search_temp)
         gc.collect()
         
@@ -245,17 +321,28 @@ async def search_face_base64(data: dict):
 
 @app.get("/faces")
 async def list_faces():
-    """List all faces from Cloudinary"""
+    """List all faces from Firebase"""
+    persons = await get_all_from_firebase()
+    
     faces = []
-    for filename, data in face_database.items():
+    for person in persons:
         faces.append({
-            "filename": filename,
-            "name": data['name'],
-            "age": data['age'],
-            "mobile": data['mobile'],
-            "city": data['city'],
-            "state": data['state'],
-            "cloudinary_url": data['url']
+            "id": person.get('id'),
+            "name": person['name'],
+            "age": person['age'],
+            "mobile": person['mobile'],
+            "city": person['city'],
+            "state": person['state'],
+            "photo_url": person['image_url']
         })
     
     return {"faces": faces, "count": len(faces)}
+
+@app.delete("/face/{person_id}")
+async def delete_face(person_id: str):
+    """Delete person from Firebase"""
+    try:
+        db.collection('missing_persons').document(person_id).delete()
+        return {"success": True, "message": f"Deleted {person_id}"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
