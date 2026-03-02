@@ -21,6 +21,7 @@ DEEPFACE_AVAILABLE = False
 try:
     from deepface import DeepFace
     from deepface.commons import distance as dst
+    from deepface.detectors import FaceDetector
     DEEPFACE_AVAILABLE = True
     logger.info("✅ DeepFace imported successfully")
 except Exception as e:
@@ -103,7 +104,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - SHOW ALL MATCHES 30% to 100%"""
+    """Search for a face - WITH FACE DETECTION DEBUG"""
     try:
         image_base64 = data.get('image')
         
@@ -129,63 +130,83 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return []
         
-        # ===== 4 MODELS - ALL MATCHES 30% TO 100% =====
+        # ===== TRY MULTIPLE DETECTORS =====
         all_matches = []
+        detectors = ["opencv", "mtcnn", "retinaface"]  # Multiple detectors
         
-        # Model configurations
-        models_config = [
-            # (model_name, metric, min_similarity)
-            ("Facenet512", "cosine", 30),
-            ("Facenet512", "euclidean_l2", 30),
-            ("ArcFace", "cosine", 30),
-            ("VGGFace", "cosine", 30),
-        ]
-        
-        for model_name, metric, min_sim in models_config:
+        for detector in detectors:
             try:
-                logger.info(f"🔄 Trying {model_name} with {metric}")
+                logger.info(f"🔍 Using detector: {detector}")
                 
-                dfs = DeepFace.find(
-                    img_path=str(temp_path),
-                    db_path=str(KNOWN_FACES_DIR),
-                    model_name=model_name,
-                    distance_metric=metric,
-                    enforce_detection=False,
-                    silent=True,
-                    align=True
-                )
+                # First check if face is detected in query image
+                try:
+                    face_objs = DeepFace.extract_faces(
+                        img_path=str(temp_path),
+                        detector_backend=detector,
+                        enforce_detection=False
+                    )
+                    logger.info(f"✅ Face detected in query image with {detector}")
+                except Exception as e:
+                    logger.warning(f"❌ Face detection failed with {detector}: {e}")
+                    continue
                 
-                if len(dfs) > 0 and not dfs[0].empty:
-                    logger.info(f"✅ {model_name} found {len(dfs[0])} matches")
-                    
-                    for _, row in dfs[0].iterrows():
-                        # Calculate similarity
-                        if metric == "cosine":
-                            similarity = (1 - float(row['distance'])) * 100
-                        else:  # euclidean_l2
-                            similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
+                # Try different models
+                models = [
+                    ("Facenet512", "cosine"),
+                    ("Facenet512", "euclidean_l2"),
+                    ("ArcFace", "cosine"),
+                    ("VGGFace", "cosine"),
+                ]
+                
+                for model_name, metric in models:
+                    try:
+                        logger.info(f"🔄 Trying {model_name} with {metric} (detector: {detector})")
                         
-                        # Extract metadata from filename
-                        db_path = Path(row['identity'])
-                        filename_parts = db_path.name.split('_')
-                        metadata_str = filename_parts[0] if filename_parts else ""
-                        metadata_parts = metadata_str.split('|')
+                        dfs = DeepFace.find(
+                            img_path=str(temp_path),
+                            db_path=str(KNOWN_FACES_DIR),
+                            model_name=model_name,
+                            distance_metric=metric,
+                            detector_backend=detector,
+                            enforce_detection=False,
+                            silent=True,
+                            align=True
+                        )
                         
-                        person_info = {
-                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                            "matchScore": round(similarity, 2)
-                        }
-                        
-                        # Add ALL matches regardless of similarity
-                        all_matches.append(person_info)
-                        logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}% (via {model_name})")
+                        if len(dfs) > 0 and not dfs[0].empty:
+                            logger.info(f"✅ {model_name} found {len(dfs[0])} matches")
                             
+                            for _, row in dfs[0].iterrows():
+                                # Calculate similarity
+                                if metric == "cosine":
+                                    similarity = (1 - float(row['distance'])) * 100
+                                else:  # euclidean_l2
+                                    similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
+                                
+                                # Extract metadata
+                                db_path = Path(row['identity'])
+                                filename_parts = db_path.name.split('_')
+                                metadata_str = filename_parts[0] if filename_parts else ""
+                                metadata_parts = metadata_str.split('|')
+                                
+                                person_info = {
+                                    "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                                    "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                                    "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                                    "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                                    "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                                    "matchScore": round(similarity, 2)
+                                }
+                                
+                                all_matches.append(person_info)
+                                logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}%")
+                                
+                    except Exception as e:
+                        logger.warning(f"{model_name} failed with {detector}: {e}")
+                        continue
+                        
             except Exception as e:
-                logger.warning(f"{model_name} failed: {e}")
+                logger.warning(f"Detector {detector} failed: {e}")
                 continue
         
         os.remove(temp_path)
@@ -194,7 +215,7 @@ async def search_face_base64(data: dict):
             logger.info("❌ No matches found")
             return []
         
-        # Remove duplicates - keep highest score for each person
+        # Remove duplicates
         unique_matches = {}
         for match in all_matches:
             name = match['name']
