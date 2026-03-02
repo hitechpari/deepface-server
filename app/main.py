@@ -6,16 +6,22 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+import gc
+import time
 
-# Set environment variables
+# ============================================
+# ENVIRONMENT SETUP
+# ============================================
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['OMP_NUM_THREADS'] = '1'
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DeepFace import
+# ============================================
+# DEEPFACE IMPORT
+# ============================================
 DEEPFACE_AVAILABLE = False
 try:
     from deepface import DeepFace
@@ -26,11 +32,10 @@ except Exception as e:
 
 app = FastAPI(title="Missing Person Face Recognition API")
 
-# CORS setup
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -40,6 +45,10 @@ KNOWN_FACES_DIR = Path("app/known_faces")
 KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+def cleanup():
+    gc.collect()
+    time.sleep(0.1)
 
 @app.get("/")
 async def root():
@@ -52,6 +61,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    cleanup()
     return {
         "status": "healthy",
         "deepface_available": DEEPFACE_AVAILABLE,
@@ -61,7 +71,6 @@ async def health_check():
 
 @app.post("/add-face-base64")
 async def add_face_base64(data: dict):
-    """Add face from base64 image"""
     try:
         image_base64 = data.get('image')
         name = data.get('name')
@@ -73,10 +82,8 @@ async def add_face_base64(data: dict):
         if not image_base64:
             raise HTTPException(status_code=400, detail="No image provided")
         
-        # Decode base64
+        # Decode and save
         image_data = base64.b64decode(image_base64)
-        
-        # Create metadata string
         metadata = f"{name}|{age}|{mobile}|{city}|{state}"
         filename = f"{metadata}_{uuid.uuid4()}.jpg"
         file_path = KNOWN_FACES_DIR / filename
@@ -85,12 +92,9 @@ async def add_face_base64(data: dict):
             buffer.write(image_data)
         
         logger.info(f"✅ Face added: {filename}")
+        cleanup()
         
-        return {
-            "success": True,
-            "message": "Face added successfully",
-            "filename": filename
-        }
+        return {"success": True, "message": "Face added successfully"}
     
     except Exception as e:
         logger.error(f"❌ Error: {e}")
@@ -98,7 +102,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face using 4 different models - shows 40% to 100% matches"""
+    """Search WITHOUT threshold parameter - FIXED VERSION"""
     try:
         image_base64 = data.get('image')
         
@@ -116,32 +120,29 @@ async def search_face_base64(data: dict):
             return []
         
         known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
+        logger.info(f"Known faces count: {len(known_faces)}")
+        
         if len(known_faces) == 0:
             os.remove(temp_path)
             return []
         
-        # ===== 4 DIFFERENT MODELS WITH DIFFERENT THRESHOLDS =====
+        # ===== FIXED: NO THRESHOLD PARAMETER =====
         all_matches = []
         
-        # Model configurations: (model_name, distance_metric, threshold)
-        models_config = [
-            # Model 1: Facenet512 - Most accurate, low threshold for 40% matches
-            ("Facenet512", "cosine", 0.20),
-            
-            # Model 2: ArcFace - Best for age-invariant, medium threshold
-            ("ArcFace", "cosine", 0.25),
-            
-            # Model 3: VGGFace - Good all-rounder
-            ("VGGFace", "cosine", 0.28),
-            
-            # Model 4: Facenet with Euclidean - Different metric for variety
-            ("Facenet512", "euclidean_l2", 0.7),
+        # Model configurations - WITHOUT threshold
+        models_to_try = [
+            ("Facenet512", "cosine"),
+            ("Facenet512", "euclidean_l2"),
+            ("ArcFace", "cosine"),
+            ("VGGFace", "cosine"),
         ]
         
-        # Try each model configuration
-        for model_name, metric, threshold in models_config:
+        for model_name, metric in models_to_try:
             try:
-                logger.info(f"🔄 Trying {model_name} with {metric}, threshold={threshold}")
+                logger.info(f"🔄 Trying {model_name} with {metric}")
+                
+                # Clean memory before each model
+                cleanup()
                 
                 dfs = DeepFace.find(
                     img_path=str(temp_path),
@@ -150,41 +151,45 @@ async def search_face_base64(data: dict):
                     distance_metric=metric,
                     enforce_detection=False,
                     silent=True,
-                    threshold=threshold,
                     align=True
                 )
                 
                 if len(dfs) > 0 and not dfs[0].empty:
+                    logger.info(f"✅ {model_name} found {len(dfs[0])} matches")
+                    
                     for _, row in dfs[0].iterrows():
-                        # Calculate similarity percentage
+                        # Calculate similarity
                         if metric == "cosine":
                             similarity = (1 - float(row['distance'])) * 100
-                        else:  # euclidean_l2
+                        else:
                             similarity = max(0, min(100, 100 - (float(row['distance']) * 100)))
                         
-                        # Include ALL matches from 40% to 100%
+                        # MANUAL threshold - include if similarity >= 40%
                         if similarity >= 40:
-                            # Extract metadata from filename
+                            # Extract metadata
                             db_path = Path(row['identity'])
                             filename_parts = db_path.name.split('_')
                             metadata_str = filename_parts[0] if filename_parts else ""
                             metadata_parts = metadata_str.split('|')
                             
-                            match_data = {
+                            all_matches.append({
                                 "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
                                 "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
                                 "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
                                 "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
                                 "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                                "matchScore": round(similarity, 2),
-                                "model": model_name  # Track which model found it
-                            }
-                            all_matches.append(match_data)
+                                "matchScore": round(similarity, 2)
+                            })
                             
-                            logger.info(f"✅ Match: {match_data['name']} - {similarity:.1f}% (via {model_name})")
-                            
+                            logger.info(f"✅ Match: {similarity:.1f}%")
+                
+                # Clean up after each model
+                del dfs
+                cleanup()
+                
             except Exception as e:
-                logger.warning(f"Model {model_name} failed: {e}")
+                logger.warning(f"{model_name} failed: {e}")
+                cleanup()
                 continue
         
         os.remove(temp_path)
@@ -193,23 +198,17 @@ async def search_face_base64(data: dict):
             logger.info("❌ No matches found above 40%")
             return []
         
-        # Remove duplicates - keep highest score for each person
+        # Remove duplicates
         unique_matches = {}
         for match in all_matches:
             name = match['name']
             if name not in unique_matches or match['matchScore'] > unique_matches[name]['matchScore']:
                 unique_matches[name] = match
         
-        # Convert to list and sort by score (highest first)
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        # Remove model field before sending to client
-        for result in final_results:
-            if 'model' in result:
-                del result['model']
-        
-        logger.info(f"✅ Returning {len(final_results)} unique matches (40% to 100%)")
+        logger.info(f"✅ Returning {len(final_results)} matches")
         return final_results
     
     except Exception as e:
@@ -218,7 +217,6 @@ async def search_face_base64(data: dict):
 
 @app.get("/faces")
 async def list_faces():
-    """List all known faces"""
     faces = []
     for f in KNOWN_FACES_DIR.glob("*.*"):
         if f.suffix.lower() in ['.jpg', '.jpeg', '.png']:
