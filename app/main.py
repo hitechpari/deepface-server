@@ -1,13 +1,9 @@
 import os
-import sys
 import logging
-import shutil
 import uuid
 import base64
-import numpy as np
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
@@ -22,12 +18,7 @@ logger = logging.getLogger(__name__)
 # DeepFace import
 DEEPFACE_AVAILABLE = False
 try:
-    import tensorflow as tf
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-    
     from deepface import DeepFace
-    from deepface.commons import functions
     DEEPFACE_AVAILABLE = True
     logger.info("✅ DeepFace imported successfully")
 except Exception as e:
@@ -79,8 +70,6 @@ async def add_face_base64(data: dict):
         city = data.get('city')
         state = data.get('state')
         
-        current_date = datetime.now().strftime("%Y%m%d")
-        
         if not image_base64:
             raise HTTPException(status_code=400, detail="No image provided")
         
@@ -88,9 +77,8 @@ async def add_face_base64(data: dict):
         image_data = base64.b64decode(image_base64)
         
         # Create metadata string
-        metadata = f"{name}|{age}|{mobile}|{city}|{state}|{current_date}"
+        metadata = f"{name}|{age}|{mobile}|{city}|{state}"
         filename = f"{metadata}_{uuid.uuid4()}.jpg"
-        
         file_path = KNOWN_FACES_DIR / filename
         
         with open(file_path, "wb") as buffer:
@@ -110,7 +98,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face with ULTRA TOLERANT matching"""
+    """Search for a face using 4 different models - shows 40% to 100% matches"""
     try:
         image_base64 = data.get('image')
         
@@ -125,122 +113,104 @@ async def search_face_base64(data: dict):
         
         if not DEEPFACE_AVAILABLE:
             os.remove(temp_path)
-            return {"matched": False, "error": "DeepFace not available"}
+            return []
         
         known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
         if len(known_faces) == 0:
             os.remove(temp_path)
-            return {"matched": False, "message": "No faces in database"}
+            return []
         
-        # ===== ULTRA TOLERANT CONFIGURATION =====
-        # Extremely low thresholds for maximum matches
-        models_config = [
-            # Model, Metric, Threshold (very low = very tolerant)
-            ("Facenet512", "cosine", 0.20),      # Most tolerant (was 0.30)
-            ("Facenet512", "euclidean_l2", 0.6),  # Very tolerant (was 0.8)
-            ("ArcFace", "cosine", 0.25),          # Tolerant (was 0.40)
-            ("VGGFace", "cosine", 0.30),          # Added VGGFace for more matches
-        ]
-        
-        # Multiple detectors for better face detection
-        detectors = ["mtcnn", "opencv", "retinaface"]
-        
+        # ===== 4 DIFFERENT MODELS WITH DIFFERENT THRESHOLDS =====
         all_matches = []
         
-        for detector in detectors:
-            for model_name, distance_metric, threshold in models_config:
-                try:
-                    logger.info(f"🔄 Trying {detector}/{model_name} (threshold: {threshold})")
-                    
-                    result = DeepFace.find(
-                        img_path=str(temp_path),
-                        db_path=str(KNOWN_FACES_DIR),
-                        model_name=model_name,
-                        distance_metric=distance_metric,
-                        detector_backend=detector,
-                        enforce_detection=False,
-                        silent=True,
-                        threshold=threshold,
-                        normalization="base",
-                        align=True
-                    )
-                    
-                    if len(result) > 0 and not result[0].empty:
-                        for idx, match in result[0].iterrows():
-                            distance = float(match['distance'])
+        # Model configurations: (model_name, distance_metric, threshold)
+        models_config = [
+            # Model 1: Facenet512 - Most accurate, low threshold for 40% matches
+            ("Facenet512", "cosine", 0.20),
+            
+            # Model 2: ArcFace - Best for age-invariant, medium threshold
+            ("ArcFace", "cosine", 0.25),
+            
+            # Model 3: VGGFace - Good all-rounder
+            ("VGGFace", "cosine", 0.28),
+            
+            # Model 4: Facenet with Euclidean - Different metric for variety
+            ("Facenet512", "euclidean_l2", 0.7),
+        ]
+        
+        # Try each model configuration
+        for model_name, metric, threshold in models_config:
+            try:
+                logger.info(f"🔄 Trying {model_name} with {metric}, threshold={threshold}")
+                
+                dfs = DeepFace.find(
+                    img_path=str(temp_path),
+                    db_path=str(KNOWN_FACES_DIR),
+                    model_name=model_name,
+                    distance_metric=metric,
+                    enforce_detection=False,
+                    silent=True,
+                    threshold=threshold,
+                    align=True
+                )
+                
+                if len(dfs) > 0 and not dfs[0].empty:
+                    for _, row in dfs[0].iterrows():
+                        # Calculate similarity percentage
+                        if metric == "cosine":
+                            similarity = (1 - float(row['distance'])) * 100
+                        else:  # euclidean_l2
+                            similarity = max(0, min(100, 100 - (float(row['distance']) * 100)))
+                        
+                        # Include ALL matches from 40% to 100%
+                        if similarity >= 40:
+                            # Extract metadata from filename
+                            db_path = Path(row['identity'])
+                            filename_parts = db_path.name.split('_')
+                            metadata_str = filename_parts[0] if filename_parts else ""
+                            metadata_parts = metadata_str.split('|')
                             
-                            # Convert distance to similarity
-                            if distance_metric == "cosine":
-                                similarity = (1 - distance) * 100
-                            else:
-                                similarity = max(0, min(100, 100 - (distance * 100)))
+                            match_data = {
+                                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                                "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                                "matchScore": round(similarity, 2),
+                                "model": model_name  # Track which model found it
+                            }
+                            all_matches.append(match_data)
                             
-                            # VERY LOW THRESHOLD - 40% se upar sab match karo
-                            if similarity >= 40:  # Was 50%, now 40%
-                                # Extract metadata
-                                db_path = Path(match['identity'])
-                                filename_parts = db_path.name.split('_')
-                                metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
-                                metadata_parts = metadata_str.split('|')
-                                
-                                person_info = {
-                                    "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                                    "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                                    "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                                    "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                                    "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                                    "photo_date": metadata_parts[5] if len(metadata_parts) > 5 else "Unknown"
-                                }
-                                
-                                all_matches.append({
-                                    "similarity": similarity,
-                                    "person_info": person_info,
-                                    "model": model_name,
-                                    "detector": detector,
-                                    "distance": distance
-                                })
-                                
-                                logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}%")
-                    
-                except Exception as e:
-                    logger.warning(f"Combination {detector}/{model_name} failed: {e}")
-                    continue
+                            logger.info(f"✅ Match: {match_data['name']} - {similarity:.1f}% (via {model_name})")
+                            
+            except Exception as e:
+                logger.warning(f"Model {model_name} failed: {e}")
+                continue
         
         os.remove(temp_path)
         
         if not all_matches:
-            logger.info("❌ No matches found")
+            logger.info("❌ No matches found above 40%")
             return []
         
-        # Sort by similarity
-        all_matches.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        # Group by person and take highest similarity for each
-        person_best_matches = {}
+        # Remove duplicates - keep highest score for each person
+        unique_matches = {}
         for match in all_matches:
-            name = match['person_info']['name']
-            if name not in person_best_matches or match['similarity'] > person_best_matches[name]['similarity']:
-                person_best_matches[name] = match
+            name = match['name']
+            if name not in unique_matches or match['matchScore'] > unique_matches[name]['matchScore']:
+                unique_matches[name] = match
         
-        # Convert to list and sort again
-        unique_matches = list(person_best_matches.values())
-        unique_matches.sort(key=lambda x: x['similarity'], reverse=True)
+        # Convert to list and sort by score (highest first)
+        final_results = list(unique_matches.values())
+        final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        # Return ALL matches above 40%, not just top 5
-        results = []
-        for match in unique_matches:
-            if match['similarity'] >= 40:  # 40% se upar sab
-                results.append({
-                    "name": match['person_info']['name'],
-                    "age": match['person_info']['age'],
-                    "mobile": match['person_info']['mobile'],
-                    "city": match['person_info']['city'],
-                    "state": match['person_info']['state'],
-                    "matchScore": round(match['similarity'], 2)
-                })
+        # Remove model field before sending to client
+        for result in final_results:
+            if 'model' in result:
+                del result['model']
         
-        logger.info(f"✅ Returning {len(results)} matches")
-        return results
+        logger.info(f"✅ Returning {len(final_results)} unique matches (40% to 100%)")
+        return final_results
     
     except Exception as e:
         logger.error(f"❌ Search error: {e}")
@@ -253,7 +223,7 @@ async def list_faces():
     for f in KNOWN_FACES_DIR.glob("*.*"):
         if f.suffix.lower() in ['.jpg', '.jpeg', '.png']:
             filename_parts = f.name.split('_')
-            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
+            metadata_str = filename_parts[0] if filename_parts else ""
             metadata_parts = metadata_str.split('|')
             
             faces.append({
