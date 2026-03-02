@@ -110,7 +110,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face with improved matching"""
+    """Search for a face with ULTRA TOLERANT matching"""
     try:
         image_base64 = data.get('image')
         
@@ -132,93 +132,104 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return {"matched": False, "message": "No faces in database"}
         
-        # ===== IMPROVED MATCHING CONFIGURATION =====
-        # Lower thresholds for better matching
+        # ===== ULTRA TOLERANT CONFIGURATION =====
+        # Extremely low thresholds for maximum matches
         models_config = [
-            # Model, Metric, Threshold (lower = more matches)
-            ("Facenet512", "cosine", 0.30),      # Most tolerant
-            ("Facenet512", "euclidean_l2", 0.8),  # L2 normalized
-            ("ArcFace", "cosine", 0.40),          # Good for variations
+            # Model, Metric, Threshold (very low = very tolerant)
+            ("Facenet512", "cosine", 0.20),      # Most tolerant (was 0.30)
+            ("Facenet512", "euclidean_l2", 0.6),  # Very tolerant (was 0.8)
+            ("ArcFace", "cosine", 0.25),          # Tolerant (was 0.40)
+            ("VGGFace", "cosine", 0.30),          # Added VGGFace for more matches
         ]
         
-        detector_backend = "mtcnn"
-        best_matches = []
+        # Multiple detectors for better face detection
+        detectors = ["mtcnn", "opencv", "retinaface"]
         
-        for model_name, distance_metric, threshold in models_config:
-            try:
-                logger.info(f"🔄 Trying {model_name} with threshold {threshold}")
-                
-                result = DeepFace.find(
-                    img_path=str(temp_path),
-                    db_path=str(KNOWN_FACES_DIR),
-                    model_name=model_name,
-                    distance_metric=distance_metric,
-                    detector_backend=detector_backend,
-                    enforce_detection=False,
-                    silent=True,
-                    threshold=threshold,  # Using lower threshold
-                    normalization="base",
-                    align=True
-                )
-                
-                if len(result) > 0 and not result[0].empty:
-                    for idx, match in result[0].iterrows():
-                        distance = float(match['distance'])
-                        
-                        # Convert distance to similarity percentage
-                        if distance_metric == "cosine":
-                            similarity = (1 - distance) * 100
-                        else:
-                            similarity = max(0, min(100, 100 - (distance * 100)))
-                        
-                        # Only include if similarity > 50%
-                        if similarity >= 50:
-                            # Extract metadata
-                            db_path = Path(match['identity'])
-                            filename_parts = db_path.name.split('_')
-                            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
-                            metadata_parts = metadata_str.split('|')
+        all_matches = []
+        
+        for detector in detectors:
+            for model_name, distance_metric, threshold in models_config:
+                try:
+                    logger.info(f"🔄 Trying {detector}/{model_name} (threshold: {threshold})")
+                    
+                    result = DeepFace.find(
+                        img_path=str(temp_path),
+                        db_path=str(KNOWN_FACES_DIR),
+                        model_name=model_name,
+                        distance_metric=distance_metric,
+                        detector_backend=detector,
+                        enforce_detection=False,
+                        silent=True,
+                        threshold=threshold,
+                        normalization="base",
+                        align=True
+                    )
+                    
+                    if len(result) > 0 and not result[0].empty:
+                        for idx, match in result[0].iterrows():
+                            distance = float(match['distance'])
                             
-                            person_info = {
-                                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                                "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                                "photo_date": metadata_parts[5] if len(metadata_parts) > 5 else "Unknown"
-                            }
+                            # Convert distance to similarity
+                            if distance_metric == "cosine":
+                                similarity = (1 - distance) * 100
+                            else:
+                                similarity = max(0, min(100, 100 - (distance * 100)))
                             
-                            best_matches.append({
-                                "similarity": similarity,
-                                "person_info": person_info,
-                                "model": model_name,
-                                "distance": distance
-                            })
-                            
-                            logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}%")
-                
-            except Exception as e:
-                logger.warning(f"Model {model_name} failed: {e}")
-                continue
+                            # VERY LOW THRESHOLD - 40% se upar sab match karo
+                            if similarity >= 40:  # Was 50%, now 40%
+                                # Extract metadata
+                                db_path = Path(match['identity'])
+                                filename_parts = db_path.name.split('_')
+                                metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
+                                metadata_parts = metadata_str.split('|')
+                                
+                                person_info = {
+                                    "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                                    "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                                    "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                                    "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                                    "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                                    "photo_date": metadata_parts[5] if len(metadata_parts) > 5 else "Unknown"
+                                }
+                                
+                                all_matches.append({
+                                    "similarity": similarity,
+                                    "person_info": person_info,
+                                    "model": model_name,
+                                    "detector": detector,
+                                    "distance": distance
+                                })
+                                
+                                logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}%")
+                    
+                except Exception as e:
+                    logger.warning(f"Combination {detector}/{model_name} failed: {e}")
+                    continue
         
         os.remove(temp_path)
         
-        # Sort by similarity (highest first)
-        best_matches.sort(key=lambda x: x['similarity'], reverse=True)
+        if not all_matches:
+            logger.info("❌ No matches found")
+            return []
         
-        # Remove duplicates (same person from different models)
-        unique_matches = []
-        seen_names = set()
-        for match in best_matches:
+        # Sort by similarity
+        all_matches.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # Group by person and take highest similarity for each
+        person_best_matches = {}
+        for match in all_matches:
             name = match['person_info']['name']
-            if name not in seen_names:
-                seen_names.add(name)
-                unique_matches.append(match)
+            if name not in person_best_matches or match['similarity'] > person_best_matches[name]['similarity']:
+                person_best_matches[name] = match
         
-        if unique_matches:
-            # Return top matches
-            results = []
-            for match in unique_matches[:5]:  # Top 5 matches
+        # Convert to list and sort again
+        unique_matches = list(person_best_matches.values())
+        unique_matches.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # Return ALL matches above 40%, not just top 5
+        results = []
+        for match in unique_matches:
+            if match['similarity'] >= 40:  # 40% se upar sab
                 results.append({
                     "name": match['person_info']['name'],
                     "age": match['person_info']['age'],
@@ -227,10 +238,9 @@ async def search_face_base64(data: dict):
                     "state": match['person_info']['state'],
                     "matchScore": round(match['similarity'], 2)
                 })
-            
-            return results
-        else:
-            return []
+        
+        logger.info(f"✅ Returning {len(results)} matches")
+        return results
     
     except Exception as e:
         logger.error(f"❌ Search error: {e}")
