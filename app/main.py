@@ -79,6 +79,7 @@ async def add_face_base64(data: dict):
         
         # Decode base64
         image_data = base64.b64decode(image_base64)
+        logger.info(f"Image decoded, size: {len(image_data)} bytes")
         
         # Create metadata string
         metadata = f"{name}|{age}|{mobile}|{city}|{state}"
@@ -102,7 +103,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - WITH 30% THRESHOLD - ALL MATCHES SHOW"""
+    """Search for a face - SHOW ALL MATCHES 30% to 100%"""
     try:
         image_base64 = data.get('image')
         
@@ -128,16 +129,16 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return []
         
-        # ===== ALL MATCHES FROM 30% TO 100% =====
+        # ===== 4 MODELS - ALL MATCHES 30% TO 100% =====
         all_matches = []
         
-        # 4 Different Models with 30% threshold
+        # Model configurations
         models_config = [
             # (model_name, metric, min_similarity)
-            ("Facenet512", "cosine", 30),        # 30% similarity minimum
-            ("Facenet512", "euclidean_l2", 30),   # 30% similarity minimum
-            ("ArcFace", "cosine", 30),            # 30% similarity minimum
-            ("VGGFace", "cosine", 30),            # 30% similarity minimum
+            ("Facenet512", "cosine", 30),
+            ("Facenet512", "euclidean_l2", 30),
+            ("ArcFace", "cosine", 30),
+            ("VGGFace", "cosine", 30),
         ]
         
         for model_name, metric, min_sim in models_config:
@@ -155,34 +156,33 @@ async def search_face_base64(data: dict):
                 )
                 
                 if len(dfs) > 0 and not dfs[0].empty:
-                    logger.info(f"✅ {model_name} found matches")
+                    logger.info(f"✅ {model_name} found {len(dfs[0])} matches")
                     
                     for _, row in dfs[0].iterrows():
-                        # Calculate similarity based on metric
+                        # Calculate similarity
                         if metric == "cosine":
                             similarity = (1 - float(row['distance'])) * 100
                         else:  # euclidean_l2
                             similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
                         
-                        # Include if similarity >= 30%
-                        if similarity >= min_sim:
-                            # Extract metadata from filename
-                            db_path = Path(row['identity'])
-                            filename_parts = db_path.name.split('_')
-                            metadata_str = filename_parts[0] if filename_parts else ""
-                            metadata_parts = metadata_str.split('|')
-                            
-                            person_info = {
-                                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
-                                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
-                                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
-                                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
-                                "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
-                                "matchScore": round(similarity, 2)
-                            }
-                            
-                            all_matches.append(person_info)
-                            logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}% (via {model_name})")
+                        # Extract metadata from filename
+                        db_path = Path(row['identity'])
+                        filename_parts = db_path.name.split('_')
+                        metadata_str = filename_parts[0] if filename_parts else ""
+                        metadata_parts = metadata_str.split('|')
+                        
+                        person_info = {
+                            "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                            "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                            "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                            "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                            "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                            "matchScore": round(similarity, 2)
+                        }
+                        
+                        # Add ALL matches regardless of similarity
+                        all_matches.append(person_info)
+                        logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}% (via {model_name})")
                             
             except Exception as e:
                 logger.warning(f"{model_name} failed: {e}")
@@ -191,7 +191,7 @@ async def search_face_base64(data: dict):
         os.remove(temp_path)
         
         if not all_matches:
-            logger.info("❌ No matches found above 30%")
+            logger.info("❌ No matches found")
             return []
         
         # Remove duplicates - keep highest score for each person
@@ -204,7 +204,7 @@ async def search_face_base64(data: dict):
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        logger.info(f"✅ Returning {len(final_results)} matches (30% to 100%)")
+        logger.info(f"✅ Returning {len(final_results)} matches")
         return final_results
     
     except Exception as e:
