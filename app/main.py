@@ -1,172 +1,322 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
 import os
-import logging
+from pathlib import Path
 import uuid
 import base64
-from pathlib import Path
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import gc
+from PIL import Image
+import io
+import numpy as np
 
-# ============================================
-# MINIMAL SETUP
-# ============================================
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['OMP_NUM_THREADS'] = '1'
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# DEEPFACE IMPORT
-# ============================================
-DEEPFACE_AVAILABLE = False
+# DeepFace import with error handling
 try:
     from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
-    logger.info("✅ DeepFace imported")
-except Exception as e:
-    logger.error(f"❌ Import failed: {e}")
+except ImportError as e:
+    print(f"DeepFace import error: {e}")
+    DEEPFACE_AVAILABLE = False
 
-app = FastAPI(title="Missing Person API")
+app = FastAPI(title="Missing Person Face Recognition API")
 
-# CORS
+# CORS setup - Allow all origins (for Google Apps Script)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Directories
+# Known faces directory
 KNOWN_FACES_DIR = Path("app/known_faces")
 KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
+
+# Temporary directory for uploads
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.get("/")
 async def root():
-    gc.collect()
     return {
-        "message": "Missing Person API",
-        "deepface": DEEPFACE_AVAILABLE,
-        "faces": len(list(KNOWN_FACES_DIR.glob("*.*")))
+        "message": "Missing Person Face Recognition API",
+        "status": "healthy",
+        "deepface_available": DEEPFACE_AVAILABLE,
+        "known_faces_count": len(list(KNOWN_FACES_DIR.glob("*.*")))
     }
 
 @app.get("/health")
-async def health():
-    gc.collect()
-    return {"status": "ok"}
+async def health_check():
+    return {
+        "status": "healthy",
+        "deepface_available": DEEPFACE_AVAILABLE,
+        "timestamp": str(uuid.uuid4())
+    }
+
+@app.post("/add-face")
+async def add_face(
+    file: UploadFile = File(...),
+    name: str = None,
+    age: str = None,
+    mobile: str = None,
+    city: str = None,
+    state: str = None
+):
+    """Add a new face to the database with metadata"""
+    try:
+        # Validate file type
+        if not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Generate filename with metadata
+        file_extension = file.filename.split(".")[-1].lower()
+        if file_extension not in ['jpg', 'jpeg', 'png']:
+            file_extension = 'jpg'
+        
+        # Create metadata string
+        metadata = f"{name}|{age}|{mobile}|{city}|{state}"
+        filename = f"{metadata}_{uuid.uuid4()}.{file_extension}"
+        
+        file_path = KNOWN_FACES_DIR / filename
+        
+        # Save file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        return {
+            "success": True,
+            "message": "Face added successfully",
+            "filename": filename,
+            "metadata": {
+                "name": name,
+                "age": age,
+                "mobile": mobile,
+                "city": city,
+                "state": state
+            }
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/add-face-base64")
-async def add_face(data: dict):
+async def add_face_base64(data: dict):
+    """Add face from base64 image"""
     try:
-        img = data.get('image')
+        image_base64 = data.get('image')
         name = data.get('name')
         age = data.get('age')
         mobile = data.get('mobile')
         city = data.get('city')
         state = data.get('state')
         
-        if not img:
-            raise HTTPException(400, "No image")
+        if not image_base64:
+            raise HTTPException(status_code=400, detail="No image provided")
         
-        img_data = base64.b64decode(img)
+        # Decode base64
+        image_data = base64.b64decode(image_base64)
+        
+        # Create metadata string
         metadata = f"{name}|{age}|{mobile}|{city}|{state}"
         filename = f"{metadata}_{uuid.uuid4()}.jpg"
-        path = KNOWN_FACES_DIR / filename
         
-        with open(path, "wb") as f:
-            f.write(img_data)
+        file_path = KNOWN_FACES_DIR / filename
         
-        logger.info(f"✅ Saved: {filename}")
-        gc.collect()
+        # Save file
+        with open(file_path, "wb") as buffer:
+            buffer.write(image_data)
         
-        return {"success": True}
-        
+        return {
+            "success": True,
+            "message": "Face added successfully",
+            "filename": filename
+        }
+    
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        raise HTTPException(500, str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/search-base64")
-async def search_face(data: dict):
-    """MINIMAL SEARCH - Maximum compatibility"""
+@app.post("/search")
+async def search_face(file: UploadFile = File(...)):
+    """Search for a face in the database"""
     try:
-        img = data.get('image')
-        
-        if not img:
-            raise HTTPException(400, "No image")
-        
-        # Save temp file
-        img_data = base64.b64decode(img)
-        temp = TEMP_DIR / f"{uuid.uuid4()}.jpg"
-        with open(temp, "wb") as f:
-            f.write(img_data)
-        
         if not DEEPFACE_AVAILABLE:
-            os.remove(temp)
-            return {"error": "DeepFace not available"}
+            return {
+                "matched": False,
+                "error": "DeepFace not available",
+                "fallback": True,
+                "message": "Using basic hash matching"
+            }
         
-        faces = list(KNOWN_FACES_DIR.glob("*.*"))
-        logger.info(f"Faces: {len(faces)}")
+        # Save temporary file
+        temp_path = TEMP_DIR / f"{uuid.uuid4()}.jpg"
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
         
-        if len(faces) == 0:
-            os.remove(temp)
-            return []
+        # Get list of known faces
+        known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
         
-        # ===== SIMPLEST POSSIBLE SEARCH =====
-        results = []
+        if len(known_faces) == 0:
+            os.remove(temp_path)
+            return {"matched": False, "message": "No faces in database"}
         
+        # Find matches using DeepFace
         try:
-            logger.info("🔄 Searching...")
-            
-            # Only essential parameters
-            dfs = DeepFace.find(
-                img_path=str(temp),
+            result = DeepFace.find(
+                img_path=str(temp_path),
                 db_path=str(KNOWN_FACES_DIR),
                 model_name="Facenet512",
-                enforce_detection=False
+                distance_metric="cosine",
+                enforce_detection=False,
+                silent=True
             )
+        except Exception as deepface_error:
+            print(f"DeepFace error: {deepface_error}")
+            os.remove(temp_path)
+            return {
+                "matched": False,
+                "error": str(deepface_error),
+                "fallback": True
+            }
+        
+        # Clean up
+        os.remove(temp_path)
+        
+        if len(result) > 0 and not result[0].empty:
+            # Match found
+            match = result[0].iloc[0]
+            identity_path = Path(match['identity'])
             
-            if len(dfs) > 0 and not dfs[0].empty:
-                for _, row in dfs[0].iterrows():
-                    sim = (1 - float(row['distance'])) * 100
-                    
-                    # Get name from filename
-                    fname = Path(row['identity']).name
-                    parts = fname.split('_')[0].split('|')
-                    
-                    results.append({
-                        "name": parts[0] if len(parts) > 0 else "Unknown",
-                        "age": parts[1] if len(parts) > 1 else "",
-                        "mobile": parts[2] if len(parts) > 2 else "",
-                        "city": parts[3] if len(parts) > 3 else "",
-                        "state": parts[4] if len(parts) > 4 else "",
-                        "matchScore": round(sim, 2)
-                    })
-                    
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            return {"error": str(e)}
-        
-        # Cleanup
-        os.remove(temp)
-        gc.collect()
-        
-        return results
-        
+            # Extract metadata from filename
+            filename_parts = identity_path.name.split('_')
+            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
+            metadata_parts = metadata_str.split('|')
+            
+            person_info = {
+                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                "state": metadata_parts[4] if len(metadata_parts) > 4 else ""
+            }
+            
+            similarity = (1 - float(match['distance'])) * 100
+            
+            return {
+                "matched": True,
+                "identity": identity_path.name,
+                "person_info": person_info,
+                "distance": float(match['distance']),
+                "similarity": f"{similarity:.2f}%",
+                "match_score": round(similarity, 2)
+            }
+        else:
+            return {"matched": False, "message": "No match found"}
+    
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/search-base64")
+async def search_face_base64(data: dict):
+    """Search for a face from base64 image"""
+    try:
+        image_base64 = data.get('image')
+        
+        if not image_base64:
+            raise HTTPException(status_code=400, detail="No image provided")
+        
+        # Decode base64
+        image_data = base64.b64decode(image_base64)
+        
+        # Save temporary file
+        temp_path = TEMP_DIR / f"{uuid.uuid4()}.jpg"
+        with open(temp_path, "wb") as buffer:
+            buffer.write(image_data)
+        
+        # Reuse search logic
+        if not DEEPFACE_AVAILABLE:
+            os.remove(temp_path)
+            return {
+                "matched": False,
+                "error": "DeepFace not available",
+                "fallback": True
+            }
+        
+        known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
+        
+        if len(known_faces) == 0:
+            os.remove(temp_path)
+            return {"matched": False, "message": "No faces in database"}
+        
+        try:
+            result = DeepFace.find(
+                img_path=str(temp_path),
+                db_path=str(KNOWN_FACES_DIR),
+                model_name="Facenet512",
+                distance_metric="cosine",
+                enforce_detection=False,
+                silent=True
+            )
+        except Exception as deepface_error:
+            os.remove(temp_path)
+            return {
+                "matched": False,
+                "error": str(deepface_error),
+                "fallback": True
+            }
+        
+        os.remove(temp_path)
+        
+        if len(result) > 0 and not result[0].empty:
+            match = result[0].iloc[0]
+            identity_path = Path(match['identity'])
+            
+            filename_parts = identity_path.name.split('_')
+            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
+            metadata_parts = metadata_str.split('|')
+            
+            person_info = {
+                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                "state": metadata_parts[4] if len(metadata_parts) > 4 else ""
+            }
+            
+            similarity = (1 - float(match['distance'])) * 100
+            
+            return {
+                "matched": True,
+                "identity": identity_path.name,
+                "person_info": person_info,
+                "similarity": f"{similarity:.2f}%",
+                "match_score": round(similarity, 2)
+            }
+        else:
+            return {"matched": False, "message": "No match found"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/faces")
 async def list_faces():
-    gc.collect()
+    """List all known faces with metadata"""
     faces = []
     for f in KNOWN_FACES_DIR.glob("*.*"):
-        parts = f.name.split('_')[0].split('|')
-        faces.append({
-            "filename": f.name,
-            "name": parts[0] if len(parts) > 0 else "Unknown"
-        })
+        if f.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+            filename_parts = f.name.split('_')
+            metadata_str = filename_parts[0] if len(filename_parts) > 0 else ""
+            metadata_parts = metadata_str.split('|')
+            
+            face_info = {
+                "filename": f.name,
+                "name": metadata_parts[0] if len(metadata_parts) > 0 else "Unknown",
+                "age": metadata_parts[1] if len(metadata_parts) > 1 else "",
+                "mobile": metadata_parts[2] if len(metadata_parts) > 2 else "",
+                "city": metadata_parts[3] if len(metadata_parts) > 3 else "",
+                "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
+                "size": f.stat().st_size
+            }
+            faces.append(face_info)
+    
     return {"faces": faces, "count": len(faces)}
