@@ -9,7 +9,7 @@ import gc
 import time
 
 # ============================================
-# MAXIMUM MEMORY OPTIMIZATION
+# EXTREME MEMORY OPTIMIZATION
 # ============================================
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -47,12 +47,15 @@ KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-def cleanup():
-    gc.collect()
-    time.sleep(0.3)  # More time for memory cleanup
+def force_cleanup():
+    """Aggressive memory cleanup"""
+    for _ in range(3):
+        gc.collect()
+        time.sleep(0.1)
 
 @app.get("/")
 async def root():
+    force_cleanup()
     return {
         "message": "Missing Person API",
         "deepface": DEEPFACE_AVAILABLE,
@@ -61,7 +64,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    cleanup()
+    force_cleanup()
     return {"status": "ok"}
 
 @app.post("/add-face-base64")
@@ -86,7 +89,7 @@ async def add_face(data: dict):
             f.write(img_data)
         
         logger.info(f"✅ Saved: {filename}")
-        cleanup()
+        force_cleanup()
         
         return {"success": True}
         
@@ -96,12 +99,15 @@ async def add_face(data: dict):
 
 @app.post("/search-base64")
 async def search_face(data: dict):
-    """EXTREME LIGHTWEIGHT SEARCH"""
+    """MEMORY SAFE SEARCH"""
     try:
         img = data.get('image')
         
         if not img:
             raise HTTPException(400, "No image")
+        
+        # Clean memory before starting
+        force_cleanup()
         
         # Save temp file
         img_data = base64.b64decode(img)
@@ -120,13 +126,13 @@ async def search_face(data: dict):
             os.remove(temp)
             return []
         
-        # ===== SIMPLEST POSSIBLE SEARCH =====
+        # ===== SIMPLE SEARCH WITH MEMORY SAFETY =====
         results = []
         
         try:
             logger.info("🔄 Searching...")
             
-            # Absolute minimum options - no extras
+            # Use a separate process? No, but minimal options
             dfs = DeepFace.find(
                 img_path=str(temp),
                 db_path=str(KNOWN_FACES_DIR),
@@ -157,9 +163,15 @@ async def search_face(data: dict):
         except Exception as e:
             logger.error(f"Search error: {e}")
         
-        # Cleanup
+        # Cleanup temp file
         os.remove(temp)
-        cleanup()
+        
+        # Force memory cleanup
+        force_cleanup()
+        
+        if not results:
+            logger.info("❌ No matches")
+            return []
         
         # Simple dedup
         seen = {}
@@ -175,10 +187,12 @@ async def search_face(data: dict):
         
     except Exception as e:
         logger.error(f"❌ Error: {e}")
+        force_cleanup()
         return []
 
 @app.get("/faces")
 async def list_faces():
+    force_cleanup()
     faces = []
     for f in KNOWN_FACES_DIR.glob("*.*"):
         parts = f.name.split('_')[0].split('|')
