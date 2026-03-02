@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+import numpy as np
 
 # Set environment variables
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 DEEPFACE_AVAILABLE = False
 try:
     from deepface import DeepFace
+    from deepface.commons import distance as dst
     DEEPFACE_AVAILABLE = True
     logger.info("✅ DeepFace imported successfully")
 except Exception as e:
@@ -70,6 +72,8 @@ async def add_face_base64(data: dict):
         city = data.get('city')
         state = data.get('state')
         
+        logger.info(f"📸 Add face request: {name}")
+        
         if not image_base64:
             raise HTTPException(status_code=400, detail="No image provided")
         
@@ -84,7 +88,7 @@ async def add_face_base64(data: dict):
         with open(file_path, "wb") as buffer:
             buffer.write(image_data)
         
-        logger.info(f"✅ Face added: {filename}")
+        logger.info(f"✅ File saved: {filename}")
         
         return {
             "success": True,
@@ -98,9 +102,11 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - shows ALL matches from 40% to 100%"""
+    """Search for a face - WITHOUT threshold parameter"""
     try:
         image_base64 = data.get('image')
+        
+        logger.info("🔍 Search request received")
         
         if not image_base64:
             raise HTTPException(status_code=400, detail="No image provided")
@@ -116,16 +122,21 @@ async def search_face_base64(data: dict):
             return []
         
         known_faces = list(KNOWN_FACES_DIR.glob("*.*"))
+        logger.info(f"Known faces count: {len(known_faces)}")
+        
         if len(known_faces) == 0:
             os.remove(temp_path)
             return []
         
-        # ===== 4 DIFFERENT MODELS WITH DIFFERENT THRESHOLDS =====
+        # ===== FIXED: WITHOUT threshold PARAMETER =====
         all_matches = []
         
-        # Model 1: Facenet512 with very low threshold
+        # Try different models with different distance metrics
+        # Note: threshold parameter is REMOVED - it will use default values
+        
+        # Model 1: Facenet512 with cosine
         try:
-            logger.info("🔄 Trying Facenet512 with threshold 0.20")
+            logger.info("🔄 Trying Facenet512 with cosine")
             dfs = DeepFace.find(
                 img_path=str(temp_path),
                 db_path=str(KNOWN_FACES_DIR),
@@ -133,14 +144,17 @@ async def search_face_base64(data: dict):
                 distance_metric="cosine",
                 enforce_detection=False,
                 silent=True,
-                threshold=0.20,
                 align=True
             )
             
             if len(dfs) > 0 and not dfs[0].empty:
+                logger.info(f"✅ Facenet512 found matches")
                 for _, row in dfs[0].iterrows():
-                    similarity = (1 - float(row['distance'])) * 100
-                    if similarity >= 40:
+                    distance = float(row['distance'])
+                    similarity = (1 - distance) * 100
+                    
+                    # Manual threshold - include if similarity > 30%
+                    if similarity >= 30:
                         db_path = Path(row['identity'])
                         filename_parts = db_path.name.split('_')
                         metadata_str = filename_parts[0] if filename_parts else ""
@@ -154,13 +168,13 @@ async def search_face_base64(data: dict):
                             "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
                             "matchScore": round(similarity, 2)
                         })
-                        logger.info(f"✅ Facenet512 match: {similarity:.1f}%")
+                        logger.info(f"✅ Match: {similarity:.1f}%")
         except Exception as e:
             logger.warning(f"Facenet512 failed: {e}")
         
-        # Model 2: ArcFace with low threshold
+        # Model 2: ArcFace with cosine
         try:
-            logger.info("🔄 Trying ArcFace with threshold 0.25")
+            logger.info("🔄 Trying ArcFace with cosine")
             dfs = DeepFace.find(
                 img_path=str(temp_path),
                 db_path=str(KNOWN_FACES_DIR),
@@ -168,14 +182,16 @@ async def search_face_base64(data: dict):
                 distance_metric="cosine",
                 enforce_detection=False,
                 silent=True,
-                threshold=0.25,
                 align=True
             )
             
             if len(dfs) > 0 and not dfs[0].empty:
+                logger.info(f"✅ ArcFace found matches")
                 for _, row in dfs[0].iterrows():
-                    similarity = (1 - float(row['distance'])) * 100
-                    if similarity >= 40:
+                    distance = float(row['distance'])
+                    similarity = (1 - distance) * 100
+                    
+                    if similarity >= 30:
                         db_path = Path(row['identity'])
                         filename_parts = db_path.name.split('_')
                         metadata_str = filename_parts[0] if filename_parts else ""
@@ -189,13 +205,13 @@ async def search_face_base64(data: dict):
                             "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
                             "matchScore": round(similarity, 2)
                         })
-                        logger.info(f"✅ ArcFace match: {similarity:.1f}%")
+                        logger.info(f"✅ Match: {similarity:.1f}%")
         except Exception as e:
             logger.warning(f"ArcFace failed: {e}")
         
-        # Model 3: VGGFace with medium threshold
+        # Model 3: VGGFace with cosine
         try:
-            logger.info("🔄 Trying VGGFace with threshold 0.28")
+            logger.info("🔄 Trying VGGFace with cosine")
             dfs = DeepFace.find(
                 img_path=str(temp_path),
                 db_path=str(KNOWN_FACES_DIR),
@@ -203,14 +219,16 @@ async def search_face_base64(data: dict):
                 distance_metric="cosine",
                 enforce_detection=False,
                 silent=True,
-                threshold=0.28,
                 align=True
             )
             
             if len(dfs) > 0 and not dfs[0].empty:
+                logger.info(f"✅ VGGFace found matches")
                 for _, row in dfs[0].iterrows():
-                    similarity = (1 - float(row['distance'])) * 100
-                    if similarity >= 40:
+                    distance = float(row['distance'])
+                    similarity = (1 - distance) * 100
+                    
+                    if similarity >= 30:
                         db_path = Path(row['identity'])
                         filename_parts = db_path.name.split('_')
                         metadata_str = filename_parts[0] if filename_parts else ""
@@ -224,13 +242,13 @@ async def search_face_base64(data: dict):
                             "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
                             "matchScore": round(similarity, 2)
                         })
-                        logger.info(f"✅ VGGFace match: {similarity:.1f}%")
+                        logger.info(f"✅ Match: {similarity:.1f}%")
         except Exception as e:
             logger.warning(f"VGGFace failed: {e}")
         
-        # Model 4: Facenet with Euclidean metric
+        # Model 4: Facenet512 with euclidean_l2
         try:
-            logger.info("🔄 Trying Facenet512 with euclidean_l2, threshold=0.7")
+            logger.info("🔄 Trying Facenet512 with euclidean_l2")
             dfs = DeepFace.find(
                 img_path=str(temp_path),
                 db_path=str(KNOWN_FACES_DIR),
@@ -238,15 +256,16 @@ async def search_face_base64(data: dict):
                 distance_metric="euclidean_l2",
                 enforce_detection=False,
                 silent=True,
-                threshold=0.7,
                 align=True
             )
             
             if len(dfs) > 0 and not dfs[0].empty:
+                logger.info(f"✅ Facenet512 (euclidean) found matches")
                 for _, row in dfs[0].iterrows():
                     distance = float(row['distance'])
                     similarity = max(0, min(100, 100 - (distance * 100)))
-                    if similarity >= 40:
+                    
+                    if similarity >= 30:
                         db_path = Path(row['identity'])
                         filename_parts = db_path.name.split('_')
                         metadata_str = filename_parts[0] if filename_parts else ""
@@ -260,14 +279,14 @@ async def search_face_base64(data: dict):
                             "state": metadata_parts[4] if len(metadata_parts) > 4 else "",
                             "matchScore": round(similarity, 2)
                         })
-                        logger.info(f"✅ Facenet512 (euclidean) match: {similarity:.1f}%")
+                        logger.info(f"✅ Match: {similarity:.1f}%")
         except Exception as e:
             logger.warning(f"Facenet512 euclidean failed: {e}")
         
         os.remove(temp_path)
         
         if not all_matches:
-            logger.info("❌ No matches found above 40%")
+            logger.info("❌ No matches found above 30%")
             return []
         
         # Remove duplicates - keep highest score for each person
@@ -277,11 +296,10 @@ async def search_face_base64(data: dict):
             if name not in unique_matches or match['matchScore'] > unique_matches[name]['matchScore']:
                 unique_matches[name] = match
         
-        # Convert to list and sort by score
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        logger.info(f"✅ Returning {len(final_results)} unique matches (40% to 100%)")
+        logger.info(f"✅ Returning {len(final_results)} unique matches (30% to 100%)")
         return final_results
     
     except Exception as e:
