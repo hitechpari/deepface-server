@@ -7,6 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import numpy as np
+import cv2
+from PIL import Image
+import io
 
 # Set environment variables
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -43,6 +46,38 @@ KNOWN_FACES_DIR = Path("app/known_faces")
 KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR = Path("/tmp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+def preprocess_image(image_path):
+    """Preprocess image to improve face detection"""
+    try:
+        # Read image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return None
+        
+        # Convert to RGB
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Enhance image
+        # 1. Denoise
+        img_denoised = cv2.fastNlMeansDenoisingColored(img_rgb, None, 10, 10, 7, 21)
+        
+        # 2. Increase contrast
+        lab = cv2.cvtColor(img_denoised, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        lab = cv2.merge([l,a,b])
+        img_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        # Save enhanced image
+        enhanced_path = image_path.parent / f"enhanced_{image_path.name}"
+        cv2.imwrite(str(enhanced_path), cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
+        
+        return enhanced_path
+    except Exception as e:
+        logger.warning(f"Image preprocessing failed: {e}")
+        return None
 
 @app.get("/")
 async def root():
@@ -92,6 +127,17 @@ async def add_face_base64(data: dict):
         
         logger.info(f"✅ File saved: {filename}")
         
+        # Try to detect face in saved image
+        try:
+            face_objs = DeepFace.extract_faces(
+                img_path=str(file_path),
+                detector_backend="opencv",
+                enforce_detection=False
+            )
+            logger.info(f"Face detection in saved image: {len(face_objs)} faces found")
+        except Exception as e:
+            logger.warning(f"Face detection in saved image failed: {e}")
+        
         return {
             "success": True,
             "message": "Face added successfully",
@@ -104,7 +150,7 @@ async def add_face_base64(data: dict):
 
 @app.post("/search-base64")
 async def search_face_base64(data: dict):
-    """Search for a face - WITH FACE DETECTION DEBUG"""
+    """Search for a face - ULTIMATE TOLERANT VERSION"""
     try:
         image_base64 = data.get('image')
         
@@ -130,57 +176,64 @@ async def search_face_base64(data: dict):
             os.remove(temp_path)
             return []
         
-        # ===== TRY MULTIPLE DETECTORS =====
+        # ===== ULTIMATE TOLERANT CONFIGURATION =====
         all_matches = []
-        detectors = ["opencv", "mtcnn", "retinaface"]  # Multiple detectors
         
-        for detector in detectors:
-            try:
-                logger.info(f"🔍 Using detector: {detector}")
-                
-                # First check if face is detected in query image
-                try:
-                    face_objs = DeepFace.extract_faces(
-                        img_path=str(temp_path),
-                        detector_backend=detector,
-                        enforce_detection=False
-                    )
-                    logger.info(f"✅ Face detected in query image with {detector}")
-                except Exception as e:
-                    logger.warning(f"❌ Face detection failed with {detector}: {e}")
-                    continue
-                
-                # Try different models
-                models = [
-                    ("Facenet512", "cosine"),
-                    ("Facenet512", "euclidean_l2"),
-                    ("ArcFace", "cosine"),
-                    ("VGGFace", "cosine"),
-                ]
-                
+        # Try preprocessing if face detection fails
+        enhanced_path = preprocess_image(temp_path)
+        if enhanced_path and enhanced_path.exists():
+            logger.info("✅ Image preprocessed for better detection")
+            search_paths = [temp_path, enhanced_path]
+        else:
+            search_paths = [temp_path]
+        
+        # Multiple detectors
+        detectors = [
+            "opencv",      # Fast, works for most cases
+            "mtcnn",       # Good for small faces
+            "retinaface",  # Best accuracy
+            "dlib",        # Reliable
+            "ssd"          # Alternative
+        ]
+        
+        # Multiple models
+        models = [
+            ("Facenet512", "cosine"),
+            ("Facenet512", "euclidean_l2"),
+            ("ArcFace", "cosine"),
+            ("VGGFace", "cosine"),
+            ("Dlib", "cosine"),
+            ("OpenFace", "cosine"),
+        ]
+        
+        total_attempts = 0
+        for search_path in search_paths:
+            for detector in detectors:
                 for model_name, metric in models:
                     try:
-                        logger.info(f"🔄 Trying {model_name} with {metric} (detector: {detector})")
+                        total_attempts += 1
+                        logger.info(f"🔄 Attempt {total_attempts}: {detector}/{model_name}/{metric}")
                         
                         dfs = DeepFace.find(
-                            img_path=str(temp_path),
+                            img_path=str(search_path),
                             db_path=str(KNOWN_FACES_DIR),
                             model_name=model_name,
                             distance_metric=metric,
                             detector_backend=detector,
-                            enforce_detection=False,
+                            enforce_detection=False,  # Don't fail if no face detected
                             silent=True,
-                            align=True
+                            align=True,
+                            normalization="base"
                         )
                         
                         if len(dfs) > 0 and not dfs[0].empty:
-                            logger.info(f"✅ {model_name} found {len(dfs[0])} matches")
+                            logger.info(f"✅ Match found with {detector}/{model_name}")
                             
                             for _, row in dfs[0].iterrows():
                                 # Calculate similarity
                                 if metric == "cosine":
                                     similarity = (1 - float(row['distance'])) * 100
-                                else:  # euclidean_l2
+                                else:
                                     similarity = max(0, min(100, 100 - (float(row['distance']) * 50)))
                                 
                                 # Extract metadata
@@ -202,17 +255,16 @@ async def search_face_base64(data: dict):
                                 logger.info(f"✅ Match: {person_info['name']} - {similarity:.1f}%")
                                 
                     except Exception as e:
-                        logger.warning(f"{model_name} failed with {detector}: {e}")
+                        logger.debug(f"{detector}/{model_name} failed: {e}")
                         continue
-                        
-            except Exception as e:
-                logger.warning(f"Detector {detector} failed: {e}")
-                continue
         
+        # Clean up
         os.remove(temp_path)
+        if enhanced_path and enhanced_path.exists():
+            os.remove(enhanced_path)
         
         if not all_matches:
-            logger.info("❌ No matches found")
+            logger.info("❌ No matches found after 36 attempts")
             return []
         
         # Remove duplicates
@@ -225,7 +277,7 @@ async def search_face_base64(data: dict):
         final_results = list(unique_matches.values())
         final_results.sort(key=lambda x: x['matchScore'], reverse=True)
         
-        logger.info(f"✅ Returning {len(final_results)} matches")
+        logger.info(f"✅ Returning {len(final_results)} matches after {total_attempts} attempts")
         return final_results
     
     except Exception as e:
